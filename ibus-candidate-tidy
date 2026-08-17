@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import ctypes
+
+HEIGHT_MAX = int(os.environ.get("IBUS_TIDY_HEIGHT_MAX", "60"))
+POLL = float(os.environ.get("IBUS_TIDY_POLL", "0.12"))
+CONFIRMATIONS = 2
+OFFSCREEN = (-10000, -10000)
+VERBOSE = "--verbose" in sys.argv
+
+x11 = ctypes.CDLL("libX11.so.6")
+Display, Window = ctypes.c_void_p, ctypes.c_ulong
+
+
+class XWA(ctypes.Structure):
+	_fields_ = [
+		("x", ctypes.c_int),
+		("y", ctypes.c_int),
+		("width", ctypes.c_int),
+		("height", ctypes.c_int),
+		("border_width", ctypes.c_int),
+		("depth", ctypes.c_int),
+		("visual", ctypes.c_void_p),
+		("root", Window),
+		("class_", ctypes.c_int),
+		("bit_gravity", ctypes.c_int),
+		("win_gravity", ctypes.c_int),
+		("backing_store", ctypes.c_int),
+		("backing_planes", ctypes.c_ulong),
+		("backing_pixel", ctypes.c_ulong),
+		("save_under", ctypes.c_int),
+		("colormap", ctypes.c_ulong),
+		("map_installed", ctypes.c_int),
+		("map_state", ctypes.c_int),
+		("all_event_masks", ctypes.c_long),
+		("your_event_mask", ctypes.c_long),
+		("do_not_propagate_mask", ctypes.c_long),
+		("override_redirect", ctypes.c_int),
+		("screen", ctypes.c_void_p)
+	]
+
+
+class XClassHint(ctypes.Structure):
+	# c_void_p, not c_char_p: ctypes turns a c_char_p field into bytes and drops
+	# the pointer, so the two strings XGetClassHint() mallocs could never be
+	# freed causing two leaked allocations per poll, all session.
+	_fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+ERRH = ctypes.CFUNCTYPE(ctypes.c_int, Display, ctypes.c_void_p)
+x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = Display, [ctypes.c_char_p]
+x11.XDefaultRootWindow.restype, x11.XDefaultRootWindow.argtypes = Window, [Display]
+x11.XQueryTree.argtypes = [Display, Window, ctypes.POINTER(Window), ctypes.POINTER(Window), ctypes.POINTER(ctypes.POINTER(Window)), ctypes.POINTER(ctypes.c_uint)]
+x11.XGetWindowAttributes.argtypes = [Display, Window, ctypes.POINTER(XWA)]
+x11.XGetClassHint.argtypes = [Display, Window, ctypes.POINTER(XClassHint)]
+x11.XMoveWindow.argtypes = [Display, Window, ctypes.c_int, ctypes.c_int]
+x11.XFlush.argtypes = [Display]
+x11.XFree.argtypes = [ctypes.c_void_p]
+x11.XSetErrorHandler.restype = ctypes.c_void_p
+x11.XSetErrorHandler.argtypes = [ERRH]
+
+# The candidate window is destroyed and recreated freely; querying one that has just gone must not print Xlib noise or abort this process.
+_keep = ERRH(lambda d, e: 0)
+x11.XSetErrorHandler(_keep)
+
+dpy = x11.XOpenDisplay(None)
+if not dpy:
+	sys.stderr.write("ibus-candidate-tidy: cannot open display\n")
+	sys.exit(2)
+
+root = x11.XDefaultRootWindow(dpy)
+
+
+def log(msg):
+	if VERBOSE:
+		print(f"ibus-candidate-tidy: {msg}", flush=True)
+
+
+def attrs(win):
+	a = XWA()
+	if not x11.XGetWindowAttributes(dpy, win, ctypes.byref(a)):
+		return None
+
+	return a
+
+
+def is_candidate(win):
+	ch = XClassHint()
+
+	if not x11.XGetClassHint(dpy, win, ctypes.byref(ch)):
+		return False
+
+	try:
+		name = ctypes.string_at(ch.res_name).decode(errors="replace") if ch.res_name else ""
+		cls = ctypes.string_at(ch.res_class).decode(errors="replace") if ch.res_class else ""
+	finally:
+		for ptr in (ch.res_name, ch.res_class):
+			if ptr:
+				x11.XFree(ptr)
+
+	return "ibus-ui-gtk3" in name.lower() or "ibus-ui-gtk3" in cls.lower()
+
+
+def find_candidate():
+	r, p = Window(), Window()
+	kids = ctypes.POINTER(Window)()
+	n = ctypes.c_uint()
+
+	if not x11.XQueryTree(dpy, root, ctypes.byref(r), ctypes.byref(p), ctypes.byref(kids), ctypes.byref(n)):
+		return None
+
+	found = None
+	for i in range(n.value):
+		w = kids[i]
+		a = attrs(w)
+		if a and a.map_state == 2 and a.override_redirect and is_candidate(w):
+			found = w
+			break
+
+	if kids:
+		x11.XFree(kids)
+
+	return found
+
+
+win = None
+small_seen = 0
+log(f"started (height_max={HEIGHT_MAX} poll={POLL}s)")
+
+while True:
+	a = attrs(win) if win else None
+	if a is None or a.map_state != 2:
+		win = find_candidate()
+		small_seen = 0
+		time.sleep(POLL)
+		continue
+
+	# Nothing to do until IBus brings it back.
+	if a.x <= -1000:
+		small_seen = 0
+		time.sleep(POLL)
+		continue
+
+	if a.height < HEIGHT_MAX:
+		small_seen += 1
+		if small_seen >= CONFIRMATIONS:
+			x11.XMoveWindow(dpy, win, *OFFSCREEN)
+			x11.XFlush(dpy)
+			log(f"parked leftover {a.width}x{a.height} window 0x{win:08x} offscreen")
+			small_seen = 0
+	else:
+		small_seen = 0
+
+	time.sleep(POLL)

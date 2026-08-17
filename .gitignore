@@ -1,0 +1,14 @@
+.idea/
+.vscode/
+*.swp
+*~
+
+__pycache__/
+*.py[cod]
+
+*.bak-*
+*.prev
+
+.venv
+
+_documentation

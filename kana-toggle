@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# Toggle Mozc between hiragana and full-width katakana.
+
+SWITCH="$(dirname "$0")/kana-switch"
+[ -x "$SWITCH" ] || SWITCH=kana-switch
+
+exec "$SWITCH" toggle "$@"

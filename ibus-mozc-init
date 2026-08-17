@@ -1,0 +1,248 @@
+#!/bin/sh
+
+ENGINE=mozc-jp
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+LOG="$STATE_DIR/ibus-mozc-init.log"
+XIM_LOG="$STATE_DIR/ibus-x11.log"
+DAEMON_LOG="$STATE_DIR/ibus-daemon.log"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/ibus-mozc-init.lock"
+KANA_STATE="${XDG_RUNTIME_DIR:-/tmp}/mozc-kana-state"
+TIDY_OFF="$HOME/.config/ibus-candidate-tidy.disabled"
+
+BUS_WAIT=60       # Seconds to wait for the ibus daemon to answer at all
+ACTIVATE_WAIT=90  # Seconds to keep trying to select the engine
+CALL_TIMEOUT=5    # Seconds any single ibus call may block
+LOGIN_PHASE=300   # Seconds of fast polling after login
+XMODMAP_PHASE=60  # Seconds of re-applying ~/.Xmodmap after login
+FAST_INTERVAL=5   # Poll period during the login phase
+SLOW_INTERVAL=15  # Poll period for the rest of the session
+DEEP_EVERY=300    # Seconds between full ibus-health probes
+
+WATCH=0
+[ "$1" = "--watch" ] && WATCH=1
+
+# Where's ibus-x11?
+XIM_BIN=""
+for candidate in                            \
+    "$IBUS_X11_BIN"                         \
+    /usr/libexec/ibus-x11                   \
+    /usr/lib/ibus/ibus-x11                  \
+    /usr/lib64/ibus/ibus-x11                \
+    /usr/lib/x86_64-linux-gnu/ibus/ibus-x11 \
+    /usr/local/libexec/ibus-x11
+do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && { XIM_BIN="$candidate"; break; }
+done
+
+TIDY_BIN="$(dirname "$0")/ibus-candidate-tidy"
+[ -x "$TIDY_BIN" ] || TIDY_BIN="$(command -v ibus-candidate-tidy 2>/dev/null)"
+
+SWITCH_BIN="$(dirname "$0")/kana-switch"
+[ -x "$SWITCH_BIN" ] || SWITCH_BIN="$(command -v kana-switch 2>/dev/null)"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+log() {
+    # stdout is /dev/null under xfce4-session, so log to $LOG and stderr.
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"
+    printf 'ibus-mozc-init: %s\n' "$*" >&2
+}
+
+now() { date +%s; }
+
+# Truncate in place, never rename: ibus-x11 holds $XIM_LOG open for the whole session and would keep appending to an unlinked inode.
+trim_log() {
+    [ -f "$1" ] || return 0
+    [ "$(wc -l <"$1" 2>/dev/null || echo 0)" -gt "$2" ] || return 0
+    tmp="$1.trim.$$"
+
+    if tail -n "$3" "$1" >"$tmp" 2>/dev/null; then
+        cat "$tmp" >"$1" 2>/dev/null
+    fi
+
+    rm -f "$tmp"
+}
+
+trim_log "$LOG" 2000 500
+trim_log "$XIM_LOG" 2000 500
+
+# One watcher at a time.
+if [ "$WATCH" = 1 ]; then
+    exec 9>"$LOCK" || exit 1
+    if ! flock -n 9; then
+        log "another watcher is already running; nothing to do"
+        exit 0
+    fi
+fi
+
+engine_now() { timeout "$CALL_TIMEOUT" ibus engine 2>/dev/null; }
+set_engine()  { timeout "$CALL_TIMEOUT" ibus engine "$ENGINE" >/dev/null 2>&1; }
+
+x_alive() { xset q >/dev/null 2>&1; }
+
+context() {
+    command -v xdotool >/dev/null 2>&1 || return 0
+    printf 'focus=%s' "$(timeout 2 xdotool getactivewindow getwindowname 2>/dev/null || echo '?')"
+}
+
+apply_xmodmap() {
+    [ -f "$HOME/.Xmodmap" ] || return 0
+    xmodmap "$HOME/.Xmodmap" 2>/dev/null
+
+    [ -n "$SWITCH_BIN" ] && [ -x "$SWITCH_BIN" ] && "$SWITCH_BIN" norepeat >/dev/null 2>&1
+
+    return 0
+}
+
+# 9>&- throughout
+start_xim() {
+    if [ -z "$XIM_BIN" ]; then
+        log "WARNING: no ibus-x11 binary found; set IBUS_X11_BIN to its path"
+        return 1
+    fi
+
+    # Never --kill-daemon cause that makes ibus-x11's exit tear down the daemon, turning the next XIM crash into a total outage.
+    setsid nohup "$XIM_BIN" >>"$XIM_LOG" 2>&1 </dev/null 9>&- &
+    sleep 1
+}
+
+ensure_tidy() {
+    [ -n "$TIDY_BIN" ] && [ -x "$TIDY_BIN" ] || return 0
+    [ -f "$TIDY_OFF" ] && return 0
+
+    # The bracket stops the pattern matching a shell whose command line contains the name.
+    pgrep -f 'ibus-candidate[-]tidy' >/dev/null 2>&1 && return 0
+    setsid nohup "$TIDY_BIN" >/dev/null 2>&1 </dev/null 9>&- &
+
+    log "started ibus-candidate-tidy"
+}
+
+ensure_xim() {
+    pgrep -x ibus-x11 >/dev/null 2>&1 && return 0
+    log "XIM server (ibus-x11) is gone -- restarting it; see $XIM_LOG"
+
+    start_xim
+
+    if pgrep -x ibus-x11 >/dev/null 2>&1; then
+        log "XIM server restarted"
+    else
+        log "WARNING: XIM server failed to restart"
+    fi
+}
+
+start_daemon() {
+    # -d is the only form verified to survive a detached launch.
+    ibus-daemon -drxR >>"$DAEMON_LOG" 2>&1 9>&-
+}
+
+log "Start (watch=$WATCH)"
+[ -n "$XIM_BIN" ] || log "WARNING: ibus-x11 not found in any known location"
+
+# 1. Daemon must exist; .xprofile normally starts it.
+if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
+    log "no ibus-daemon, starting one"
+    start_daemon
+    sleep 2
+fi
+
+# 2. Wait for the bus.
+deadline=$(( $(now) + BUS_WAIT ))
+while :; do
+    timeout "$CALL_TIMEOUT" ibus list-engine >/dev/null 2>&1 && break
+    if [ "$(now)" -ge "$deadline" ]; then
+        log "FAILED: bus never answered in ${BUS_WAIT}s; giving up"
+        exit 1
+    fi
+    sleep 1
+done
+
+log "bus answered"
+
+# 3. Select Mozc.
+deadline=$(( $(now) + ACTIVATE_WAIT ))
+while [ "$(engine_now)" != "$ENGINE" ]; do
+    set_engine
+    if [ "$(now)" -ge "$deadline" ]; then
+        log "FAILED to activate $ENGINE in ${ACTIVATE_WAIT}s (engine is '$(engine_now)')"
+        apply_xmodmap
+        exit 1
+    fi
+    sleep 1
+done
+log "active engine: $ENGINE"
+
+ensure_xim
+ensure_tidy
+apply_xmodmap
+
+# 4. Mozc starts in DIRECT with hiragana, so drop stale kana state.
+rm -f "$KANA_STATE"
+
+[ "$WATCH" = 1 ] || exit 0
+
+log "supervising: engine + XIM, ${FAST_INTERVAL}s for the first ${LOGIN_PHASE}s then ${SLOW_INTERVAL}s"
+
+elapsed=0
+since_deep=0
+engine_fixes=0
+xim_fixes=0
+daemon_fixes=0
+
+while :; do
+    if [ "$elapsed" -lt "$LOGIN_PHASE" ]; then
+        interval="$FAST_INTERVAL"
+    else
+        interval="$SLOW_INTERVAL"
+    fi
+
+    sleep "$interval" 9>&-
+    elapsed=$((elapsed + interval))
+    since_deep=$((since_deep + interval))
+
+    # The session is over when the X server goes.
+    if ! x_alive; then
+        log "X server gone after ${elapsed}s ($engine_fixes engine / $xim_fixes XIM repair(s)); exiting"
+        exit 0
+    fi
+
+    # The daemon must come back first; the checks below cannot work without it.
+    if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
+        daemon_fixes=$((daemon_fixes + 1))
+        log "ibus-daemon itself is gone at ${elapsed}s (repair #$daemon_fixes) [$(context)], restarting"
+        start_daemon
+        sleep 3
+        rm -f "$KANA_STATE"
+    fi
+
+    if [ "$(engine_now)" != "$ENGINE" ]; then
+        engine_fixes=$((engine_fixes + 1))
+        log "global engine was cleared at ${elapsed}s (repair #$engine_fixes) [$(context)], re-setting $ENGINE"
+        set_engine
+        rm -f "$KANA_STATE"   # A rebuilt engine comes back in hiragana
+    fi
+
+    if ! pgrep -x ibus-x11 >/dev/null 2>&1; then
+        xim_fixes=$((xim_fixes + 1))
+        log "XIM server died at ${elapsed}s (repair #$xim_fixes) [$(context)]"
+        ensure_xim
+    fi
+
+    ensure_tidy
+
+    [ "$elapsed" -le "$XMODMAP_PHASE" ] && apply_xmodmap
+
+    # Catches an ibus-x11 that is alive but no longer owns the @server=ibus selection, which pgrep cannot see.
+    if [ "$since_deep" -ge "$DEEP_EVERY" ]; then
+        since_deep=0
+        trim_log "$LOG" 2000 500
+        trim_log "$XIM_LOG" 2000 500
+        if command -v ibus-health >/dev/null 2>&1 && ! ibus-health --quiet; then
+            log "deep probe failed while the cheap checks passed, restarting XIM server"
+            pkill -x ibus-x11 2>/dev/null
+            sleep 1
+            start_xim
+            xim_fixes=$((xim_fixes + 1))
+            ibus-health --quiet && log "deep probe healthy again" || log "WARNING: still unhealthy after XIM restart"
+        fi
+    fi
+done

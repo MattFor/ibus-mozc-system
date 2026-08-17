@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mozc", "config1.db")
+
+KEYMAP_FIELD = 42  # Config.custom_keymap_table (TSV string)
+SELECT_FIELD = 20  # Config.session_keymap
+SELECT_CUSTOM = 0  # SessionKeymap.CUSTOM
+HEADER = "status\tkey\tcommand"
+
+WIRE_VARINT, WIRE_64, WIRE_BYTES, WIRE_32 = 0, 1, 2, 5
+
+
+def die(msg):
+	print(f"mozc-keymap: {msg}", file=sys.stderr)
+	sys.exit(1)
+
+
+def read_varint(buf, pos):
+	result = shift = 0
+	while True:
+		if pos >= len(buf):
+			raise ValueError("truncated varint")
+
+		byte = buf[pos]
+		result |= (byte & 0x7F) << shift
+		pos += 1
+		shift += 7
+
+		if not byte & 0x80:
+			return result, pos
+
+
+def write_varint(value):
+	out = bytearray()
+	while True:
+		byte = value & 0x7F
+		value >>= 7
+		out.append(byte | (0x80 if value else 0))
+
+		if not value:
+			return bytes(out)
+
+
+def parse(buf):
+	"""[(field_number, wire_type, raw_value_bytes)] in file order."""
+	fields, pos = [], 0
+	while pos < len(buf):
+		tag, pos = read_varint(buf, pos)
+		number, wire = tag >> 3, tag & 7
+		if wire == WIRE_VARINT:
+			start = pos
+			_, pos = read_varint(buf, pos)
+			value = buf[start:pos]
+		elif wire == WIRE_64:
+			value, pos = buf[pos:pos + 8], pos + 8
+		elif wire == WIRE_BYTES:
+			length, pos = read_varint(buf, pos)
+			value, pos = buf[pos:pos + length], pos + length
+		elif wire == WIRE_32:
+			value, pos = buf[pos:pos + 4], pos + 4
+		else:
+			raise ValueError(f"unsupported wire type {wire} for field {number}")
+
+		fields.append((number, wire, value))
+
+	return fields
+
+
+def serialise(fields):
+	out = bytearray()
+	for number, wire, value in fields:
+		out += write_varint(number << 3 | wire)
+
+		if wire == WIRE_BYTES:
+			out += write_varint(len(value))
+
+		out += value
+
+	return bytes(out)
+
+
+def load_config():
+	try:
+		with open(CONFIG, "rb") as fh:
+			raw = fh.read()
+	except OSError as e:
+		die(f"cannot read {CONFIG}: {e}")
+
+	try:
+		return raw, parse(raw)
+	except ValueError as e:
+		die(f"{CONFIG} is not a config protobuf this tool understands ({e})")
+
+
+def current_table(fields):
+	for number, wire, value in fields:
+		if number == KEYMAP_FIELD and wire == WIRE_BYTES:
+			return value.decode("utf-8", "replace")
+
+	return None
+
+
+def check(text, source):
+	rows = [ln for ln in text.split("\n") if ln.strip()]
+	if not rows or rows[0].strip() != HEADER:
+		die(f"{source}: first line must be the header {HEADER!r}")
+
+	seen = {}
+
+	for n, row in enumerate(rows[1:], start=2):
+		parts = row.split("\t")
+
+		if len(parts) != 3:
+			die(f"{source}:{n}: expected 3 tab-separated columns, got {len(parts)}")
+		state, key, command = (p.strip() for p in parts)
+
+		if not (state and key and command):
+			die(f"{source}:{n}: empty column")
+
+		# Mozc silently keeps the last binding for a repeated (state, key).
+		if (state, key) in seen:
+			die(f"{source}:{n}: {state}\t{key} is already bound on line {seen[(state, key)]}; Mozc would silently keep only the last one")
+
+		seen[(state, key)] = n
+
+	return rows
+
+
+def cmd_show(argv):
+	_raw, fields = load_config()
+	table = current_table(fields)
+
+	if table is None:
+		die("no custom keymap is stored; Mozc is using a built-in preset")
+
+	sys.stdout.write(table if table.endswith("\n") else table + "\n")
+
+	return 0
+
+
+def cmd_diff(argv):
+	if not argv:
+		die("usage: mozc-keymap diff FILE")
+
+	_raw, fields = load_config()
+	live = (current_table(fields) or "").split("\n")
+	want = open(argv[0]).read().split("\n")
+	live = [ln for ln in live if ln.strip()]
+	want = [ln for ln in want if ln.strip()]
+	live_set, want_set = set(live), set(want)
+	removed = [ln for ln in live if ln not in want_set]
+	added = [ln for ln in want if ln not in live_set]
+
+	for ln in removed:
+		print(f"-{ln}")
+
+	for ln in added:
+		print(f"+{ln}")
+
+	if not removed and not added:
+		print("identical")
+		return 0
+
+	return 1
+
+
+def cmd_apply(argv):
+	files = [a for a in argv if not a.startswith("-")]
+	restart = "--restart" in argv
+
+	if not files:
+		die("usage: mozc-keymap apply FILE [--restart]")
+
+	try:
+		text = open(files[0]).read()
+	except OSError as e:
+		die(f"cannot read {files[0]}: {e}")
+	check(text, files[0])
+	if not text.endswith("\n"):
+		text += "\n"
+
+	raw, fields = load_config()
+	backup = f"{CONFIG}.bak-{time.strftime('%Y%m%d%H%M%S')}"
+	shutil.copy2(CONFIG, backup)
+
+	rebuilt, saw_keymap, saw_select = [], False, False
+	for number, wire, value in fields:
+		if number == KEYMAP_FIELD and wire == WIRE_BYTES:
+			rebuilt.append((number, wire, text.encode()))
+			saw_keymap = True
+		elif number == SELECT_FIELD and wire == WIRE_VARINT:
+			rebuilt.append((number, wire, write_varint(SELECT_CUSTOM)))
+			saw_select = True
+		else:
+			rebuilt.append((number, wire, value))
+
+	if not saw_select:
+		rebuilt.append((SELECT_FIELD, WIRE_VARINT, write_varint(SELECT_CUSTOM)))
+
+	if not saw_keymap:
+		rebuilt.append((KEYMAP_FIELD, WIRE_BYTES, text.encode()))
+
+	out = serialise(rebuilt)
+
+	try:
+		if current_table(parse(out)) != text:
+			raise ValueError("round-trip mismatch")
+	except ValueError as e:
+		die(f"refusing to write a config that does not round-trip ({e}); {CONFIG} is untouched, backup at {backup}")
+
+	tmp = f"{CONFIG}.new-{os.getpid()}"
+
+	with open(tmp, "wb") as fh:
+		fh.write(out)
+
+	shutil.copystat(CONFIG, tmp)
+	os.replace(tmp, CONFIG)
+
+	print(f"mozc-keymap: wrote {len(text.encode())} bytes of keymap to {CONFIG}")
+	print(f"mozc-keymap: previous config saved as {backup}")
+	print(f"mozc-keymap: {'unchanged' if out == raw else 'config changed'}")
+
+	if restart:
+		# mozc_server caches the config at startup; the client relaunches it.
+		subprocess.run(["pkill", "-x", "mozc_server"], check=False)
+		time.sleep(0.5)
+		print("mozc-keymap: mozc_server stopped; it restarts on the next keystroke")
+	else:
+		print("mozc-keymap: restart mozc_server for this to take effect (pkill -x mozc_server), or pass --restart")
+
+	return 0
+
+
+COMMANDS = {"show": cmd_show, "diff": cmd_diff, "apply": cmd_apply}
+
+
+def main(argv):
+	if len(argv) < 2 or argv[1] not in COMMANDS:
+		die("usage: mozc-keymap {show | diff FILE | apply FILE [--restart]}")
+
+	return COMMANDS[argv[1]](argv[2:])
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv))

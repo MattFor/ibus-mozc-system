@@ -1,0 +1,136 @@
+#!/bin/sh
+
+# Install ibus-mozc-system for the current user.
+#
+#   ./install                 scripts, ~/.Xmodmap and the autostart entries
+#   ./install --keymap        also import mozc/keymap.tsv into Mozc
+#   ./install --shortcuts     also create the two XFCE keyboard shortcuts
+#   ./install --all           all of the above
+#   ./install --dry-run       print what would happen with no changes
+
+set -eu
+
+SRC="$(cd "$(dirname "$0")" && pwd)"
+BIN="$HOME/.local/bin"
+AUTOSTART="$HOME/.config/autostart"
+XMODMAP="$HOME/.Xmodmap"
+STAMP="$(date +%Y%m%d%H%M%S)"
+
+SCRIPTS="kana-switch kana-toggle kana-width ibus-mozc-init ibus-health ibus-candidate-tidy mozc-keymap"
+
+DO_KEYMAP=0
+DO_SHORTCUTS=0
+DRY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --keymap)    DO_KEYMAP=1 ;;
+        --shortcuts) DO_SHORTCUTS=1 ;;
+        --all)       DO_KEYMAP=1; DO_SHORTCUTS=1 ;;
+        --dry-run|-n) DRY=1 ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "install: unknown option $arg (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+say() { printf '%s\n' "$*"; }
+run() {
+    if [ "$DRY" = 1 ]; then
+        printf '  would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+backup() {
+    [ -e "$1" ] || return 0
+    cmp -s "$1" "$2" 2>/dev/null && return 0 # Identical, nothing to save
+    say "  backing up $1 -> $1.bak-$STAMP"
+    run cp -p "$1" "$1.bak-$STAMP"
+}
+
+missing=""
+for tool in ibus xmodmap xset pgrep pkill flock timeout setsid python3; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+[ -n "$missing" ] && say "WARNING: not found on PATH:$missing"
+
+say "Installing scripts into $BIN"
+run mkdir -p "$BIN"
+for s in $SCRIPTS; do
+    [ -f "$SRC/$s" ] || { say "  MISSING in repo: $s"; continue; }
+    run cp "$SRC/$s" "$BIN/$s"
+    run chmod +x "$BIN/$s"
+    say "  $s"
+done
+
+case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *) say "NOTE: $BIN is not on PATH. Add it in the shell profile XFCE"
+       say "      session sources, or the desktop entries will not find these." ;;
+esac
+
+say "Installing $XMODMAP"
+backup "$XMODMAP" "$SRC/Xmodmap"
+run cp "$SRC/Xmodmap" "$XMODMAP"
+if [ "$DRY" = 0 ] && [ -n "${DISPLAY:-}" ]; then
+    xmodmap "$XMODMAP" && say "  applied to the running X session"
+    "$BIN/kana-switch" norepeat >/dev/null 2>&1 &&
+        say "  auto-repeat disabled on the shortcut keys"
+fi
+
+say "Installing autostart entries into $AUTOSTART"
+run mkdir -p "$AUTOSTART"
+for d in "ibus-mozc.desktop" "Japanese keys.desktop"; do
+    backup "$AUTOSTART/$d" "$SRC/launchers/$d"
+    run cp "$SRC/launchers/$d" "$AUTOSTART/$d"
+    say "  $d"
+done
+
+if [ "$DO_KEYMAP" = 1 ]; then
+    say "Importing mozc/keymap.tsv into Mozc"
+    if [ "$DRY" = 1 ]; then
+        say "  would run: $BIN/mozc-keymap apply $SRC/mozc/keymap.tsv --restart"
+    else
+        "$BIN/mozc-keymap" apply "$SRC/mozc/keymap.tsv" --restart
+    fi
+else
+    say "Mozc keymap NOT imported. The kana keys need it, look at docs/mozc-keymap.md."
+    say "  ./install --keymap, or import mozc/keymap.tsv from Mozc's properties dialog."
+fi
+
+if [ "$DO_SHORTCUTS" = 1 ]; then
+    say "Creating XFCE keyboard shortcuts"
+    if ! command -v xfconf-query >/dev/null 2>&1; then
+        say "  xfconf-query not found; add the shortcuts by hand (look at README)"
+    else
+        for pair in "Katakana:kana-toggle" "Hiragana:kana-width"; do
+            key="${pair%%:*}"
+            cmd="${pair#*:}"
+
+            if [ "$DRY" = 1 ]; then
+                say "  would bind $key -> $BIN/$cmd"
+                continue
+            fi
+
+            xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -s "$BIN/$cmd" >/dev/null 2>&1 ||
+            xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -n -t string -s "$BIN/$cmd" >/dev/null 2>&1 ||
+
+            say "  FAILED to bind $key; add it by hand"
+            say "  $key -> $BIN/$cmd"
+        done
+    fi
+else
+    say "XFCE shortcuts NOT created. Settings -> Keyboard -> Application Shortcuts:"
+    say "  Right Ctrl (Katakana) -> kana-toggle"
+    say "  Insert     (Hiragana) -> kana-width"
+fi
+
+say ""
+say "Done. Check the result with:  ibus-health && kana-switch keys"

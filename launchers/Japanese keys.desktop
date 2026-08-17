@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Japanese keys
+Comment=Apply the Japanese key remaps from ~/.Xmodmap at login
+# Desktop entries do not expand ~ or $HOME
+Exec=sh -c 'xmodmap "$HOME/.Xmodmap"; exec "$HOME/.local/bin/kana-switch" norepeat'
+OnlyShowIn=XFCE;
+StartupNotify=false
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

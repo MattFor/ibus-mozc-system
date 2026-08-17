@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=IBus Mozc
+Comment=Activate Mozc as the IBus global engine and keep the input stack alive
+# Desktop entries do not expand ~ or $HOME
+Exec=sh -c 'exec "$HOME/.local/bin/ibus-mozc-init" --watch'
+OnlyShowIn=XFCE;
+StartupNotify=false
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

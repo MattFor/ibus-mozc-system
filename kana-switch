@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import fcntl
+import ctypes
+import contextlib
+
+MODES = ("hiragana", "katakana", "half-katakana")
+CARRIER = {"hiragana": "Muhenkan",
+           "katakana": "Hiragana_Katakana",
+           "half-katakana": "Eisu_toggle"}
+WIDTH_OF = {"katakana": "full", "half-katakana": "half"}
+KATAKANA_AT = {"full": "katakana", "half": "half-katakana"}
+
+TRIGGER_KEYSYMS = ("Katakana", "Hiragana")
+
+SESSION_PROCS = ("ibus-daemon", "ibus-engine-moz", "mozc_server")
+
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "mozc-kana-state")
+LOCK = STATE + ".lock"
+
+START = time.monotonic()
+
+WAIT_MS = int(os.environ.get("KANA_WAIT_MS", "800"))
+HOLD_MS = int(os.environ.get("KANA_HOLD_MS", "5000"))
+SETTLE_MS = int(os.environ.get("KANA_SETTLE_MS", "60"))
+MAP_SETTLE_MS = int(os.environ.get("KANA_MAP_SETTLE_MS", "30"))
+
+VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
+
+
+def log(msg):
+	if VERBOSE:
+		print(f"kana-switch: {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg, code=2):
+	print(f"kana-switch: {msg}", file=sys.stderr, flush=True)
+	sys.exit(code)
+
+
+Display = ctypes.c_void_p
+KeySym = ctypes.c_ulong
+KeyCode = ctypes.c_ubyte
+
+
+class XModifierKeymap(ctypes.Structure):
+	_fields_ = [
+		("max_keypermod", ctypes.c_int),
+		("modifiermap", ctypes.POINTER(KeyCode))
+	]
+
+
+class XKeyboardControl(ctypes.Structure):
+	_fields_ = [
+		("key_click_percent", ctypes.c_int),
+		("bell_percent", ctypes.c_int),
+		("bell_pitch", ctypes.c_int),
+		("bell_duration", ctypes.c_int),
+		("led", ctypes.c_int),
+		("led_mode", ctypes.c_int),
+		("key", ctypes.c_int),
+		("auto_repeat_mode", ctypes.c_int)
+	]
+
+
+class XKeyboardState(ctypes.Structure):
+	_fields_ = [
+		("key_click_percent", ctypes.c_int),
+		("bell_percent", ctypes.c_int),
+		("bell_pitch", ctypes.c_uint),
+		("bell_duration", ctypes.c_uint),
+		("led_mask", ctypes.c_ulong),
+		("global_auto_repeat", ctypes.c_int),
+		("auto_repeats", ctypes.c_ubyte * 32)
+	]
+
+
+KB_KEY, KB_AUTO_REPEAT_MODE = 1 << 6, 1 << 7
+AUTO_REPEAT_OFF = 0
+
+x11 = ctypes.CDLL("libX11.so.6")
+x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = Display, [ctypes.c_char_p]
+x11.XCloseDisplay.restype, x11.XCloseDisplay.argtypes = ctypes.c_int, [Display]
+x11.XSync.restype, x11.XSync.argtypes = ctypes.c_int, [Display, ctypes.c_int]
+x11.XStringToKeysym.restype, x11.XStringToKeysym.argtypes = KeySym, [ctypes.c_char_p]
+x11.XKeysymToKeycode.restype, x11.XKeysymToKeycode.argtypes = KeyCode, [Display, KeySym]
+x11.XDisplayKeycodes.restype = ctypes.c_int
+x11.XDisplayKeycodes.argtypes = [Display, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+x11.XGetKeyboardMapping.restype = ctypes.POINTER(KeySym)
+x11.XGetKeyboardMapping.argtypes = [Display, KeyCode, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+x11.XChangeKeyboardMapping.restype = ctypes.c_int
+x11.XChangeKeyboardMapping.argtypes = [Display, ctypes.c_int, ctypes.c_int, ctypes.POINTER(KeySym), ctypes.c_int]
+x11.XQueryKeymap.restype, x11.XQueryKeymap.argtypes = ctypes.c_int, [Display, ctypes.c_char_p]
+x11.XGetModifierMapping.restype = ctypes.POINTER(XModifierKeymap)
+x11.XGetModifierMapping.argtypes = [Display]
+x11.XFreeModifiermap.restype = ctypes.c_int
+x11.XFreeModifiermap.argtypes = [ctypes.POINTER(XModifierKeymap)]
+x11.XFree.restype, x11.XFree.argtypes = ctypes.c_int, [ctypes.c_void_p]
+x11.XChangeKeyboardControl.restype = ctypes.c_int
+x11.XChangeKeyboardControl.argtypes = [Display, ctypes.c_ulong, ctypes.POINTER(XKeyboardControl)]
+x11.XGetKeyboardControl.restype = ctypes.c_int
+x11.XGetKeyboardControl.argtypes = [Display, ctypes.POINTER(XKeyboardState)]
+
+try:
+	xtst = ctypes.CDLL("libXtst.so.6")
+	xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+	xtst.XTestFakeKeyEvent.argtypes = [Display, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+	xtst.XTestQueryExtension.restype = ctypes.c_int
+	xtst.XTestQueryExtension.argtypes = [Display] + [ctypes.POINTER(ctypes.c_int)] * 4
+except OSError:
+	xtst = None
+
+
+def open_display():
+	dpy = x11.XOpenDisplay(None)
+	if not dpy:
+		die(f"cannot open display (DISPLAY={os.environ.get('DISPLAY')})")
+
+	return dpy
+
+
+def keyboard_mapping(dpy):
+	"""{keycode: [keysym, ...]} for the whole keyboard."""
+	lo, hi = ctypes.c_int(), ctypes.c_int()
+	x11.XDisplayKeycodes(dpy, ctypes.byref(lo), ctypes.byref(hi))
+	count = hi.value - lo.value + 1
+	per = ctypes.c_int()
+	buf = x11.XGetKeyboardMapping(dpy, lo.value, count, ctypes.byref(per))
+
+	if not buf:
+		return {}, lo.value, hi.value, 0
+
+	table = {lo.value + i: [buf[i * per.value + j] for j in range(per.value)] for i in range(count)}
+	x11.XFree(buf)
+
+	return table, lo.value, hi.value, per.value
+
+
+def keycodes_for(table, names):
+	"""Every keycode producing any of these keysyms, in any column."""
+	wanted = {x11.XStringToKeysym(n.encode()) for n in names}
+	wanted.discard(0)
+	return {kc for kc, syms in table.items() if wanted & set(syms)}
+
+
+def modifier_keycodes(dpy):
+	mm = x11.XGetModifierMapping(dpy)
+	if not mm:
+		return set()
+
+	n = mm.contents.max_keypermod * 8
+	out = {mm.contents.modifiermap[i] for i in range(n)}
+	x11.XFreeModifiermap(mm)
+	out.discard(0)
+
+	return out
+
+
+def repeat_enabled(dpy):
+	"""{keycode: bool} from the server's per-key auto-repeat vector."""
+	state = XKeyboardState()
+	if not x11.XGetKeyboardControl(dpy, ctypes.byref(state)):
+		return {}
+
+	bits = state.auto_repeats
+
+	return {kc: bool(bits[kc >> 3] >> (kc & 7) & 1) for kc in range(256)}
+
+
+def disable_repeat(dpy, keycodes):
+	"""Turn off auto-repeat for these keycodes."""
+	control = XKeyboardControl()
+	control.auto_repeat_mode = AUTO_REPEAT_OFF
+	for keycode in sorted(keycodes):
+		control.key = keycode
+		x11.XChangeKeyboardControl(dpy, KB_KEY | KB_AUTO_REPEAT_MODE, ctypes.byref(control))
+
+	x11.XSync(dpy, False)
+
+
+def held_keycodes(dpy):
+	buf = ctypes.create_string_buffer(32)
+	x11.XQueryKeymap(dpy, buf)
+	bits = buf.raw
+	return {kc for kc in range(256) if bits[kc >> 3] >> (kc & 7) & 1}
+
+
+_xtest_ok = None
+
+
+def have_xtest(dpy):
+	global _xtest_ok
+	if _xtest_ok is None:
+		if xtst is None:
+			_xtest_ok = False
+		else:
+			ev, err, major, minor = (ctypes.c_int() for _ in range(4))
+			_xtest_ok = bool(xtst.XTestQueryExtension(dpy, ctypes.byref(ev), ctypes.byref(err), ctypes.byref(major), ctypes.byref(minor)))
+		if not _xtest_ok:
+			log("no XTEST extension; falling back to xdotool")
+
+	return _xtest_ok
+
+
+def fake_key(dpy, keycode, press):
+	if not have_xtest(dpy):
+		return False
+
+	xtst.XTestFakeKeyEvent(dpy, keycode, 1 if press else 0, 0)
+
+	return True
+
+
+def wait_until_quiet(dpy, triggers, modifiers):
+	"""Wait for the shortcut key and modifiers to come up."""
+	start = time.monotonic()
+	hold_deadline = start + HOLD_MS / 1000.0
+	mod_deadline = start + WAIT_MS / 1000.0
+	warned = False
+
+	while True:
+		held = held_keycodes(dpy)
+		now = time.monotonic()
+		trigger_down = held & triggers
+		mods_down = (held & modifiers) - triggers
+
+		if trigger_down and now < hold_deadline:
+			if not warned and now - start > 0.5:
+				warned = True
+				log(f"shortcut key {sorted(trigger_down)} still down; switching when it comes up")
+			time.sleep(0.01)
+			continue
+
+		if mods_down and now < mod_deadline:
+			time.sleep(0.01)
+			continue
+
+		if trigger_down:
+			log(f"shortcut key {sorted(trigger_down)} held over {HOLD_MS}ms; acting anyway")
+
+		if mods_down:
+			log(f"modifiers {sorted(mods_down)} still down after {WAIT_MS}ms; clearing")
+
+		return mods_down
+
+
+def send_keysym(dpy, name, table, per_code, trigger_kcs, stuck_mods):
+	"""Inject one keysym with no modifiers in effect."""
+	keysym = x11.XStringToKeysym(name.encode())
+	if not keysym:
+		die(f"no such keysym: {name}")
+
+	keycode = x11.XKeysymToKeycode(dpy, keysym)
+	borrowed = None
+	if keycode and table.get(keycode, [0])[0] == keysym and keycode not in trigger_kcs:
+		log(f"{name} is on keycode {keycode}")
+	else:
+		free = [kc for kc, syms in table.items() if not any(syms)]
+		if not free:
+			die(f"{name} is not in the keymap and there is no free keycode to borrow")
+
+		keycode = borrowed = free[-1]
+		syms = (KeySym * per_code)(*([keysym] * per_code))
+		x11.XChangeKeyboardMapping(dpy, keycode, per_code, syms, 1)
+		x11.XSync(dpy, False)
+		time.sleep(MAP_SETTLE_MS / 1000.0)
+		log(f"borrowed keycode {keycode} for {name}")
+
+	# Shift Muhenkan is a different Mozc binding, so held modifiers must go.
+	to_clear = sorted(stuck_mods - trigger_kcs)
+	for kc in to_clear:
+		fake_key(dpy, kc, False)
+
+	if not fake_key(dpy, keycode, True):
+		import subprocess
+		x11.XSync(dpy, False)
+		subprocess.run(["xdotool", "key", name], check=False)
+	else:
+		fake_key(dpy, keycode, False)
+
+	for kc in to_clear:
+		fake_key(dpy, kc, True)
+
+	x11.XSync(dpy, False)
+
+	if borrowed is not None:
+		time.sleep(MAP_SETTLE_MS / 1000.0)
+		syms = (KeySym * per_code)()
+		x11.XChangeKeyboardMapping(dpy, borrowed, per_code, syms, 1)
+		x11.XSync(dpy, False)
+
+
+def fingerprint():
+	"""PID and start time of the processes holding the Mozc session."""
+	found = []
+	try:
+		pids = [p for p in os.listdir("/proc") if p.isdigit()]
+	except OSError:
+		return "?"
+
+	for pid in pids:
+		try:
+			with open(f"/proc/{pid}/comm") as fh:
+				comm = fh.read().strip()
+
+			if not any(comm.startswith(p) for p in SESSION_PROCS):
+				continue
+
+			with open(f"/proc/{pid}/stat") as fh:
+				# starttime is field 22; comm (field 2) may contain spaces.
+				start = fh.read().rpartition(")")[2].split()[19]
+
+			found.append(f"{comm}:{pid}:{start}")
+
+		except (OSError, IndexError):
+			continue
+
+	return ",".join(sorted(found)) or "none"
+
+
+def read_state():
+	"""(mode, width, reason)"""
+	try:
+		with open(STATE) as fh:
+			lines = fh.read().split("\n")
+	except OSError:
+		return None, "full", "no state file"
+
+	mode = lines[0].strip() if lines else ""
+	stored_fp = ""
+	width = "full"
+	for line in lines[1:]:
+		if line.startswith("session="):
+			stored_fp = line[len("session="):].strip()
+		elif line.startswith("width="):
+			width = line[len("width="):].strip()
+
+	if width not in KATAKANA_AT:
+		width = "full"
+
+	if mode not in MODES:
+		return None, width, f"unusable state {mode!r}"
+	if not stored_fp:
+		return None, width, "state predates session tracking"
+	if stored_fp != fingerprint():
+		return None, width, "Mozc session was restarted since the state was written"
+
+	return mode, width, "state is current"
+
+
+def write_state(mode, width):
+	tmp = f"{STATE}.{os.getpid()}"
+	try:
+		with open(tmp, "w") as fh:
+			fh.write(f"{mode}\nwidth={width}\nsession={fingerprint()}\n")
+
+		os.replace(tmp, STATE)
+	except OSError as e:
+		log(f"could not record state: {e}")
+		try:
+			os.unlink(tmp)
+		except OSError:
+			pass
+
+
+def current_mode():
+	mode, width, why = read_state()
+	if mode is None:
+		return "hiragana", "full", why, False  # Mozc's cold-start mode
+
+	return mode, width, why, True
+
+
+@contextlib.contextmanager
+def press_lock():
+	fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX)
+		yield fd
+	finally:
+		os.close(fd)
+
+
+def read_handled_until(fd):
+	"""When the press this script last acted on was released."""
+	try:
+		os.lseek(fd, 0, os.SEEK_SET)
+		value = float(os.read(fd, 64).decode().strip() or 0)
+	except (OSError, ValueError):
+		return 0.0
+
+	# Monotonic restarts at boot; a future timestamp would suppress every press.
+	return 0.0 if value > time.monotonic() + 1 else value
+
+
+def write_handled_until(fd, when):
+	os.lseek(fd, 0, os.SEEK_SET)
+	os.ftruncate(fd, 0)
+	os.write(fd, f"{when:.6f}\n".encode())
+
+
+def apply(want):
+	"""Put Mozc into a mode. `want` is a mode name, "toggle" or "width"."""
+	with press_lock() as lock:
+		if START < read_handled_until(lock):
+			# Spawned before the last press was released: same press, repeated.
+			log("coalesced: the key was still down when this copy was spawned")
+			return
+
+		mode, width, why, _ = current_mode()
+		if want == "toggle":
+			target = "hiragana" if mode != "hiragana" else KATAKANA_AT[width]
+		elif want == "width":
+			# Hiragana has no half-width form, so from there this means "the narrow kana" rather than a no-op.
+			target = "katakana" if mode == "half-katakana" else "half-katakana"
+		else:
+			target = want
+		if want in ("toggle", "width"):
+			log(f"current {mode} ({why}) -> {target}")
+
+		width = WIDTH_OF.get(target, width)
+
+		dpy = open_display()
+		try:
+			table, _lo, _hi, per = keyboard_mapping(dpy)
+			triggers = keycodes_for(table, TRIGGER_KEYSYMS)
+			log(f"trigger keycodes {sorted(triggers)}")
+
+			stuck = wait_until_quiet(dpy, triggers, modifier_keycodes(dpy))
+			released_at = time.monotonic()
+			if SETTLE_MS:
+				time.sleep(SETTLE_MS / 1000.0)
+
+			send_keysym(dpy, CARRIER[target], table, per, triggers, stuck)
+			log(f"sent {CARRIER[target]} for {target}")
+		finally:
+			x11.XCloseDisplay(dpy)
+
+		write_state(target, width)
+		write_handled_until(lock, released_at)
+
+
+def cmd_status():
+	mode, width, why, trusted = current_mode()
+	print(f"mode      : {mode}")
+	print(f"katakana  : {width}-width")
+	print(f"confidence: {'tracked' if trusted else 'assumed'} ({why})")
+	print(f"state file: {STATE}")
+	print(f"session   : {fingerprint()}")
+	return 0
+
+
+def cmd_keys():
+	dpy = open_display()
+	try:
+		table, lo, hi, per = keyboard_mapping(dpy)
+		repeats = repeat_enabled(dpy)
+		print(f"keycode range {lo}-{hi}, {per} keysyms per code")
+
+		for label, names in (("trigger", TRIGGER_KEYSYMS), ("carrier", tuple(CARRIER.values()))):
+			for name in names:
+				kcs = sorted(keycodes_for(table, [name]))
+				bad = [k for k in kcs if repeats.get(k)] if label == "trigger" else []
+				note = f"  AUTO-REPEAT ON for {bad} -- run: kana-switch norepeat" if bad else ""
+				print(f"{label:8s} {name:20s} keycode(s) {kcs or '(none - would borrow one)'}{note}")
+
+		print(f"modifier keycodes {sorted(modifier_keycodes(dpy))}")
+		print(f"currently held    {sorted(held_keycodes(dpy))}")
+
+	finally:
+		x11.XCloseDisplay(dpy)
+
+	return 0
+
+
+def cmd_norepeat():
+	dpy = open_display()
+	try:
+		table, _lo, _hi, _per = keyboard_mapping(dpy)
+		triggers = keycodes_for(table, TRIGGER_KEYSYMS)
+
+		if not triggers:
+			print("kana-switch: no shortcut keycodes in the layout; is ~/.Xmodmap applied?", file=sys.stderr)
+			return 1
+
+		disable_repeat(dpy, triggers)
+		still_on = [k for k, on in repeat_enabled(dpy).items() if on and k in triggers]
+		print(f"auto-repeat disabled for keycode(s) {sorted(triggers)}; STILL ON for {still_on}" if still_on else "")
+
+		return 1 if still_on else 0
+	finally:
+		x11.XCloseDisplay(dpy)
+
+
+def main(argv):
+	args = [a for a in argv[1:] if not a.startswith("-")]
+	action = args[0] if args else "toggle"
+
+	if action == "status":
+		return cmd_status()
+	if action == "keys":
+		return cmd_keys()
+	if action == "norepeat":
+		return cmd_norepeat()
+	if action in ("toggle", "width") or action in MODES:
+		apply(action)
+		return 0
+
+	die(f"usage: {os.path.basename(argv[0])} [toggle|width|hiragana|katakana|half-katakana|status|keys|norepeat] [--verbose]")
+
+	return None
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv))

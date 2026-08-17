@@ -1,0 +1,35 @@
+! ibus-mozc-system -- install as ~/.Xmodmap, apply with `xmodmap ~/.Xmodmap`.
+! ibus-mozc-init re-applies it during the login phase, because anything that
+! re-asserts an XKB layout (xfsettingsd, IBus) drops plain xmodmap edits.
+
+! Right Ctrl -> hiragana <-> katakana. Grabbed by XFCE, runs kana-toggle.
+keycode 105 = Katakana
+
+! Insert -> force hiragana. Grabbed by XFCE, runs kana-reset.
+keycode 118 = Hiragana
+
+! Menu -> English <-> Japanese. Handled inside Mozc, not grabbed.
+keycode 135 = Zenkaku_Hankaku
+
+! Right Ctrl must stop being a Control key: re-mapping the keysym does not
+! remove the keycode from the modifier map, and a carrier injected while
+! Control is down reaches Mozc as `Ctrl Muhenkan`, which is bound to nothing.
+! clear/add rather than remove, because it is idempotent -- `remove control =
+! Control_R` only works on a layout where keycode 105 still is Control_R.
+! Delete these two lines to keep Right Ctrl as a Control key.
+clear control
+add control = Control_L
+
+! Half-width katakana carrier. Unlike Muhenkan (102) and Hiragana_Katakana
+! (101), no base layout parks Eisu_toggle on a keycode, and a keysym with no
+! keycode has to be injected onto a borrowed one, which races clients still
+! holding the old keymap. A permanent home avoids that entirely.
+! 103 is unused on a pc105 layout; check `xmodmap -pke` before changing it.
+keycode 103 = Eisu_toggle
+
+! Muhenkan and Hiragana_Katakana get no entry here: most base layouts already
+! park them on keycodes 102 and 101, where no pc105 key produces them and XFCE
+! does not grab them. If a layout lacks them, kana-switch borrows a keycode.
+!
+! Applying this file re-enables X auto-repeat on the shortcut keycodes, which
+! xmodmap cannot express. Follow it with `kana-switch norepeat`.

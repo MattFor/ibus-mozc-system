@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import glob
+import ctypes
+import subprocess
+
+if "--help" in sys.argv or "-h" in sys.argv:
+	print(__doc__.strip())
+	sys.exit(0)
+
+QUIET = "--quiet" in sys.argv or "-q" in sys.argv
+EXPECTED_ENGINE = "mozc-jp"
+KANA_STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "mozc-kana-state")
+
+
+def say(*a):
+	if not QUIET:
+		print(*a, flush=True)
+
+
+problems = []
+toolkit_problems = []
+
+# 1. global engine. IBus clears it when the engine dies and never re-sets it.
+try:
+	engine = subprocess.run(["ibus", "engine"], capture_output=True, text=True, timeout=5).stdout.strip()
+except Exception as e:  # noqa: BLE001
+	engine = f"<call failed: {e}>"
+if engine == EXPECTED_ENGINE:
+	say(f"[ ok ] global engine    : {engine}")
+else:
+	say(f"[FAIL] global engine    : {engine or '(none)'}  (expected {EXPECTED_ENGINE})")
+	problems.append("engine")
+
+# 2. ibus-x11. ibus-daemon starts it once and never restarts it.
+xim_running = subprocess.run(["pgrep", "-x", "ibus-x11"], capture_output=True).returncode == 0
+if xim_running:
+	say("[ ok ] ibus-x11 (XIM)    : running")
+else:
+	say("[FAIL] ibus-x11 (XIM)    : NOT running")
+	problems.append("ibus-x11")
+
+# 3. XOpenIM().
+libc = ctypes.CDLL("libc.so.6")
+libc.setlocale.restype, libc.setlocale.argtypes = ctypes.c_char_p, [ctypes.c_int, ctypes.c_char_p]
+libc.setlocale(6, b"")  # LC_ALL
+
+x11 = ctypes.CDLL("libX11.so.6")
+Display, Window = ctypes.c_void_p, ctypes.c_ulong
+x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = Display, [ctypes.c_char_p]
+x11.XSetLocaleModifiers.restype, x11.XSetLocaleModifiers.argtypes = ctypes.c_char_p, [ctypes.c_char_p]
+x11.XInternAtom.restype, x11.XInternAtom.argtypes = Window, [Display, ctypes.c_char_p, ctypes.c_int]
+x11.XGetSelectionOwner.restype, x11.XGetSelectionOwner.argtypes = Window, [Display, Window]
+x11.XOpenIM.restype = ctypes.c_void_p
+x11.XOpenIM.argtypes = [Display, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+x11.XCloseIM.restype, x11.XCloseIM.argtypes = ctypes.c_int, [ctypes.c_void_p]
+x11.XCloseDisplay.restype, x11.XCloseDisplay.argtypes = ctypes.c_int, [Display]
+
+dpy = x11.XOpenDisplay(None)
+if not dpy:
+	say(f"[FAIL] X display        : cannot open (DISPLAY={os.environ.get('DISPLAY')})")
+	problems.append("display")
+else:
+	x11.XSetLocaleModifiers(b"")
+	atom = x11.XInternAtom(dpy, b"@server=ibus", 1)  # only_if_exists
+	owner = x11.XGetSelectionOwner(dpy, atom) if atom else 0
+
+	if owner:
+		say(f"[ ok ] XIM selection    : owned by window {hex(owner)}")
+	elif atom:
+		say("[FAIL] XIM selection    : root advertises @server=ibus but NOBODY OWNS IT")
+		problems.append("xim-selection")
+	else:
+		say("[FAIL] XIM selection    : no @server=ibus atom at all")
+		problems.append("xim-selection")
+
+	im = x11.XOpenIM(dpy, None, None, None)
+	if im:
+		say(f"[ ok ] XOpenIM()        : succeeded ({hex(im)})")
+		x11.XCloseIM(im)
+	else:
+		say("[FAIL] XOpenIM()        : NULL. No input method for SDL/XIM apps")
+		problems.append("xopenim")
+
+	x11.XCloseDisplay(dpy)
+
+# 4. kana state.
+try:
+	with open(KANA_STATE) as fh:
+		kana = fh.read().split("\n")[0].strip() or "(empty)"
+except OSError:
+	kana = "(none; kana-switch will assume hiragana)"
+
+say(f"[info] tracked kana     : {kana}")
+
+# 5. Toolkit.
+if not QUIET:
+	def find(*patterns):
+		for pattern in patterns:
+			hits = glob.glob(pattern)
+			if hits:
+				return hits[0]
+		return None
+
+
+	def exports(path, symbol):
+		try:
+			with open(path, "rb") as fh:
+				return symbol.encode() in fh.read()
+		except OSError:
+			return False
+
+
+	say("")
+
+	for var in ("GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"):
+		value = os.environ.get(var)
+		say(f"[{' ok ' if value else 'warn'}] {var:16s}: {value or '(unset)'}")
+
+	routes = [
+		("GTK3 apps", find("/usr/lib*/gtk-3.0/*/immodules/im-ibus.so"), "im_module_init", "GTK3, Electron/Chromium, Firefox, VTE terminals"),
+		("GTK4 apps", find("/usr/lib*/gtk-4.0/*/immodules/libim-ibus.so"), "g_io_module_load", "GTK4 apps"),
+		("Qt5 apps", find("/usr/lib*/qt5/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"), None, "Qt5 apps"),
+		("Qt6 apps", find("/usr/lib*/qt6/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"), None, "Qt6 apps"),
+	]
+
+	for label, path, symbol, who in routes:
+		if path is None:
+			say(f"[warn] {label:16s}: no IBus module installed  ({who} get no input method)")
+			toolkit_problems.append(f"{label} have no IBus module")
+		elif symbol and not exports(path, symbol):
+			say(f"[FAIL] {label:16s}: {path}")
+			say(f"       {'':16s}  does not export {symbol}, so it can never be loaded.")
+			say(f"       {'':16s}  {who} have NO Japanese input. Packaging bug in the")
+			say(f"       {'':16s}  IBus module, not a configuration problem.")
+			toolkit_problems.append(f"{label} have no input method")
+		else:
+			say(f"[ ok ] {label:16s}: {path}")
+
+say("")
+
+if problems:
+	say("UNHEALTHY: " + ", ".join(problems))
+elif toolkit_problems:
+	say("healthy, but: " + "; ".join(toolkit_problems))
+	say("(exit code unaffected - not something IBus / this project can repair)")
+else:
+	say("healthy")
+
+sys.exit(0 if not problems else 1)
