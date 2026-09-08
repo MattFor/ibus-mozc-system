@@ -5,6 +5,7 @@
 #   ./install                 scripts, ~/.Xmodmap and the autostart entries
 #   ./install --keymap        also import mozc/keymap.tsv into Mozc
 #   ./install --shortcuts     also create the two XFCE keyboard shortcuts
+#   ./install --wrappers      also route the application entries that need XIM
 #   ./install --all           all of the above
 #   ./install --dry-run       print what would happen with no changes
 
@@ -16,19 +17,25 @@ AUTOSTART="$HOME/.config/autostart"
 XMODMAP="$HOME/.Xmodmap"
 STAMP="$(date +%Y%m%d%H%M%S)"
 
-SCRIPTS="kana-switch kana-toggle kana-width ibus-mozc-init ibus-health ibus-candidate-tidy mozc-keymap"
+SCRIPTS="kana-switch kana-toggle kana-width ibus-mozc-init ibus-health ibus-candidate-tidy mozc-keymap ime-launch ime-probe"
 
 DO_KEYMAP=0
 DO_SHORTCUTS=0
+DO_WRAP=0
 DRY=0
 
 for arg in "$@"; do
     case "$arg" in
-        --keymap)    DO_KEYMAP=1 ;;
+        --keymap) DO_KEYMAP=1 ;;
         --shortcuts) DO_SHORTCUTS=1 ;;
-        --all)       DO_KEYMAP=1; DO_SHORTCUTS=1 ;;
-        --dry-run|-n) DRY=1 ;;
-        --help|-h)
+        --wrappers) DO_WRAP=1 ;;
+        --all)
+            DO_KEYMAP=1
+            DO_SHORTCUTS=1
+            DO_WRAP=1
+            ;;
+        --dry-run | -n) DRY=1 ;;
+        --help | -h)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
@@ -64,7 +71,10 @@ done
 say "Installing scripts into $BIN"
 run mkdir -p "$BIN"
 for s in $SCRIPTS; do
-    [ -f "$SRC/$s" ] || { say "  MISSING in repo: $s"; continue; }
+    [ -f "$SRC/$s" ] || {
+        say "  MISSING in repo: $s"
+        continue
+    }
     run cp "$SRC/$s" "$BIN/$s"
     run chmod +x "$BIN/$s"
     say "  $s"
@@ -72,8 +82,10 @@ done
 
 case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) say "NOTE: $BIN is not on PATH. Add it in the shell profile XFCE"
-       say "      session sources, or the desktop entries will not find these." ;;
+    *)
+        say "NOTE: $BIN is not on PATH. Add it in the shell profile XFCE"
+        say "      session sources, or the desktop entries will not find these."
+        ;;
 esac
 
 say "Installing $XMODMAP"
@@ -81,8 +93,8 @@ backup "$XMODMAP" "$SRC/Xmodmap"
 run cp "$SRC/Xmodmap" "$XMODMAP"
 if [ "$DRY" = 0 ] && [ -n "${DISPLAY:-}" ]; then
     xmodmap "$XMODMAP" && say "  applied to the running X session"
-    "$BIN/kana-switch" norepeat >/dev/null 2>&1 &&
-        say "  auto-repeat disabled on the shortcut keys"
+    "$BIN/kana-switch" norepeat >/dev/null 2>&1 \
+        && say "  auto-repeat disabled on the shortcut keys"
 fi
 
 say "Installing autostart entries into $AUTOSTART"
@@ -119,10 +131,9 @@ if [ "$DO_SHORTCUTS" = 1 ]; then
                 continue
             fi
 
-            xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -s "$BIN/$cmd" >/dev/null 2>&1 ||
-            xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -n -t string -s "$BIN/$cmd" >/dev/null 2>&1 ||
-
-            say "  FAILED to bind $key; add it by hand"
+            xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -s "$BIN/$cmd" >/dev/null 2>&1 \
+                || xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/$key" -n -t string -s "$BIN/$cmd" >/dev/null 2>&1 \
+                || say "  FAILED to bind $key; add it by hand"
             say "  $key -> $BIN/$cmd"
         done
     fi
@@ -132,5 +143,21 @@ else
     say "  Insert     (Hiragana) -> kana-width"
 fi
 
+LAUNCH="$BIN/ime-launch"
+[ -x "$LAUNCH" ] || LAUNCH="$SRC/ime-launch"
+
+if [ "$DO_WRAP" = 1 ]; then
+    say "Routing the application entries that need XIM through ime-launch"
+    if [ "$DRY" = 1 ]; then
+        "$LAUNCH" --wrap-all --dry-run 2>&1 | sed 's/^/  /'
+    else
+        "$LAUNCH" --wrap-all 2>&1 | sed 's/^/  /'
+    fi
+else
+    say "Application entries NOT wrapped. Electron/CEF programs (Steam's client"
+    say "  UI, Discord, Heroic, ...) reach IBus only once they are:"
+    say "      ime-launch --wrap-all        # or ./install --wrappers"
+fi
+
 say ""
-say "Done. Check the result with:  ibus-health && kana-switch keys"
+say "Done. Check the result with:  ibus-health && ime-probe --audit"

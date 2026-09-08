@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import TypedDict
+
+SELF = "ime-probe"
+
+PROBE_KEY = "Zenkaku_Hankaku"
+INJECT_SECONDS = 3.0
+WATCH_SECONDS = 8.0
+
+IM_MODULES = {
+	"im-ibus.so": ("ibus", "GTK3 native IBus module"),
+	"libim-ibus.so": ("ibus", "GTK4 native IBus module"),
+	"im-xim.so": ("xim", "GTK XIM module, talks to ibus-x11"),
+	"libibusplatforminputcontextplugin.so": ("ibus", "Qt IBus platform plugin"),
+	"im-fcitx.so": ("fcitx", "fcitx module -- not this stack"),
+	"libfcitxplatforminputcontextplugin.so": ("fcitx", "fcitx Qt plugin -- not this stack"),
+}
+
+
+def die(msg, code=2):
+	print(f"{SELF}: {msg}", file=sys.stderr, flush=True)
+	sys.exit(code)
+
+
+def run(*argv, timeout=5):
+	try:
+		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+		return out.stdout.strip()
+	except Exception:  # noqa: BLE001
+		return ""
+
+
+def need(tool):
+	if not shutil.which(tool):
+		die(f"{tool} is not on PATH; it is required")
+
+
+def focused_window():
+	wid = run("xdotool", "getactivewindow")
+	return wid or None
+
+
+def window_facts(wid):
+	name = run("xdotool", "getwindowname", wid)
+	pid = run("xdotool", "getwindowpid", wid)
+	cls = ""
+
+	raw = run("xprop", "-id", wid, "WM_CLASS")
+	hit = re.findall(r'"([^"]+)"', raw)
+	if hit:
+		cls = hit[-1]
+	if not name and not pid and not cls:
+		die(f"window {wid} does not exist (or is gone); nothing to probe")
+
+	return {"id": wid, "name": name, "pid": int(pid) if pid.isdigit() else None, "class": cls}
+
+
+def proc_maps_modules(pid):
+	"""Which input-method modules the process actually loaded."""
+	found = []
+
+	try:
+		with open(f"/proc/{pid}/maps") as fh:
+			for line in fh:
+				path = line.rstrip("\n").rsplit(" ", 1)[-1]
+				base = os.path.basename(path)
+				if base in IM_MODULES and path not in [p for p, _ in found]:
+					found.append((path, base))
+	except OSError:
+		return None
+
+	return found
+
+
+def proc_env(pid, names):
+	out = {}
+
+	try:
+		with open(f"/proc/{pid}/environ", "rb") as fh:
+			raw = fh.read().decode("utf-8", "replace")
+	except OSError:
+		return None
+
+	for item in raw.split("\0"):
+		key, _, value = item.partition("=")
+		if key in names:
+			out[key] = value
+
+	return out
+
+
+def proc_mapped_lib(pid, needle):
+	"""The first mapped library path containing `needle`, as the process sees it."""
+	try:
+		with open(f"/proc/{pid}/maps") as fh:
+			for line in fh:
+				path = line.rstrip("\n").rsplit(" ", 1)[-1]
+				if needle in os.path.basename(path):
+					return path
+	except OSError:
+		return None
+
+	return None
+
+
+CHROMIUM_MARKERS = (
+	"chrome_crashpad_handler",
+	"v8_context_snapshot.bin",
+	"libffmpeg.so",
+	"libcef.so",
+	"icudtl.dat",
+	"snapshot_blob.bin",
+	"resources/app.asar",
+)
+
+
+def is_chromium_proc(pid):
+	"""Whether this process is an Electron/CEF one, from its own filesystem."""
+	root = f"/proc/{pid}/root"
+
+	try:
+		exe = os.readlink(f"/proc/{pid}/exe")
+	except OSError:
+		exe = None
+
+	if exe:
+		home = os.path.dirname(exe)
+		for marker in CHROMIUM_MARKERS:
+			if os.path.exists(f"{root}{home}/{marker}"):
+				return True
+
+	for lib in ("libcef.so", "libffmpeg.so", "libvk_swiftshader.so"):
+		if proc_mapped_lib(pid, lib):
+			return True
+
+	return False
+
+
+def proc_mount_ns(pid):
+	try:
+		return os.readlink(f"/proc/{pid}/ns/mnt")
+	except OSError:
+		return None
+
+
+def namespace_immodules(pid, gtk_lib):
+	"""The GTK3 input-method modules that exist in THIS process's filesystem."""
+	root = f"/proc/{pid}/root"
+	patterns = [f"{os.path.dirname(gtk_lib).lstrip('/')}/gtk-3.0/*/immodules"]
+	patterns += ["usr/lib*/gtk-3.0/*/immodules", "usr/lib*/*/gtk-3.0/*/immodules"]
+
+	for pattern in patterns:
+		for path in sorted(glob.glob(f"{root}/{pattern}")):
+			try:
+				names = os.listdir(path)
+			except OSError:
+				continue
+
+			ids = sorted(n[3:-3] for n in names if n.startswith("im-") and n.endswith(".so"))
+			if ids:
+				return path[len(root) :], ids
+
+	return None, []
+
+
+def ibus_socket_peers():
+	"""pids holding a connection to the IBus bus, by socket inode."""
+	addr = run("ibus", "address")
+	path = addr.partition("unix:path=")[2].partition(",")[0]
+	if not path:
+		return {}, None
+
+	peers = set()
+	for line in run("ss", "-x").splitlines():
+		hit = re.search(re.escape(path) + r"\s+(\d+)\s+\*\s+(\d+)", line)
+		if hit and hit.group(2) != "0":
+			peers.add(hit.group(2))
+
+	if not peers:
+		return {}, path
+
+	owners = {}
+	for entry in os.listdir("/proc"):
+		if not entry.isdigit():
+			continue
+		fddir = f"/proc/{entry}/fd"
+		try:
+			fds = os.listdir(fddir)
+		except OSError:
+			continue
+		for fd in fds:
+			try:
+				link = os.readlink(f"{fddir}/{fd}")
+			except OSError:
+				continue
+			if link.startswith("socket:["):
+				inode = link[8:-1]
+				if inode in peers:
+					owners.setdefault(int(entry), 0)
+					owners[int(entry)] += 1
+
+	return owners, path
+
+
+def watch_bus(seconds, action=None):
+	"""Count IBus method calls while `action` runs (or while the user types)."""
+	addr = run("ibus", "address")
+	if not addr:
+		die("cannot read the IBus bus address; is ibus-daemon running?")
+
+	proc = subprocess.Popen(
+		["dbus-monitor", "--address", addr],
+		stdout=subprocess.PIPE,
+		stderr=subprocess.DEVNULL,
+		text=True,
+	)
+
+	time.sleep(1.0)  # let dbus-monitor install its match rules
+
+	try:
+		if action is not None:
+			action()
+		time.sleep(seconds)
+	finally:
+		proc.terminate()
+		try:
+			out, _ = proc.communicate(timeout=5)
+		except subprocess.TimeoutExpired:
+			proc.kill()
+			out, _ = proc.communicate()
+
+	counts = {}
+	for member in re.findall(r"member=([A-Za-z]+)", out or ""):
+		counts[member] = counts.get(member, 0) + 1
+
+	return counts
+
+
+def inject_probe():
+	run("xdotool", "key", "--clearmodifiers", PROBE_KEY)
+	time.sleep(0.5)
+	run("xdotool", "key", "--clearmodifiers", PROBE_KEY)
+
+
+def host_process(pid):
+	try:
+		with open(f"/proc/{pid}/cmdline", "rb") as fh:
+			return bool(fh.read().strip(b"\0"))
+	except OSError:
+		return False
+
+
+def report(window, counts, injected):
+	pid = window["pid"]
+	sandboxed = bool(pid) and not host_process(pid)
+
+	print(f"window   : {window['id']}  {window['name']!r}")
+	print(f"class    : {window['class'] or '(none)'}")
+	print(
+		f"pid      : {pid if pid else '(unknown)'}"
+		+ ("   (inside the app's own PID namespace -- sandboxed, e.g. flatpak)" if sandboxed else "")
+	)
+	print()
+
+	route = None
+	gap = None
+
+	if sandboxed:
+		print("process  : not inspectable from here. A sandboxed app's environment")
+		print("           and loaded modules live inside its namespace; what matters")
+		print("           is whether keys come out, which is measured below.")
+	elif pid:
+		env = proc_env(pid, {"GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS", "SDL_IM_MODULE", "GLFW_IM_MODULE"})
+		if env is None:
+			print("env      : (cannot read /proc/%d/environ)" % pid)
+		else:
+			shown = {k: v for k, v in env.items() if v}
+			print("env      : " + (", ".join(f"{k}={v}" for k, v in sorted(shown.items())) or "(no IM variables set)"))
+
+		mods = proc_maps_modules(pid)
+		if mods is None:
+			print("module   : (cannot read /proc/%d/maps)" % pid)
+		elif not mods:
+			print("module   : none loaded -- this process has no input-method module at all")
+		else:
+			for path, base in mods:
+				kind, what = IM_MODULES[base]
+				route = route or kind
+				print(f"module   : {path}")
+				print(f"           {what}")
+
+		wanted = (env or {}).get("GTK_IM_MODULE") or ""
+		contained = proc_mount_ns(pid) not in (None, proc_mount_ns("self"))
+		gtk_lib = proc_mapped_lib(pid, "libgtk-3.so")
+		im_dir, im_ids = namespace_immodules(pid, gtk_lib) if gtk_lib else (None, [])
+
+		if wanted and im_ids and wanted not in im_ids:
+			gap = (wanted, contained)
+			whose = "the container this runs in" if contained else "this system"
+			print(f"immodules: {im_dir}")
+			print(f"           {whose} has no im-{wanted}.so there, so GTK_IM_MODULE")
+			print("           names nothing and GTK uses GtkIMContextSimple instead")
+			print(f"           installed: {', '.join(im_ids)}")
+
+		owners, _ = ibus_socket_peers()
+		if owners:
+			if pid in owners:
+				print("bus      : this process holds its own IBus connection")
+			else:
+				print("bus      : no direct IBus connection (it goes through ibus-x11, or nothing)")
+
+	print()
+
+	keys = counts.get("ProcessKeyEvent", 0)
+	how = "injected" if injected else "typed"
+	print(f"keys {how:8s}: {'2 x ' + PROBE_KEY if injected else 'whatever you pressed'}")
+	print(f"reached IBus  : {keys} ProcessKeyEvent call(s)")
+
+	other = {
+		k: v for k, v in counts.items() if k in ("FocusIn", "FocusOut", "Reset", "SetCursorLocation", "ContentType")
+	}
+	if other:
+		print("context churn : " + ", ".join(f"{k}={v}" for k, v in sorted(other.items())))
+
+	print()
+
+	if keys:
+		print("VERDICT: keys reach IBus. This window is wired up correctly.")
+		print("         If Japanese still misbehaves here it is a Mozc mode or")
+		print("         keymap question, not a routing one -- try `kana-switch status`.")
+		return 0
+
+	if sandboxed:
+		print("VERDICT: no keys reached IBus, from a sandboxed application.")
+		print()
+		print("         A flatpak gets neither the session's IM environment nor a")
+		print("         route to IBus unless it is granted them. Check that the")
+		print("         override is in place:")
+		print("             flatpak override --user --show")
+		print("         and if it is empty, apply it:")
+		print("             flatpak override --user \\")
+		print("                 --talk-name=org.freedesktop.portal.IBus \\")
+		print("                 --env=GTK_IM_MODULE=ibus --env=QT_IM_MODULE=ibus \\")
+		print("                 --env=XMODIFIERS=@im=ibus --env=SDL_IM_MODULE=ibus")
+		print()
+		print("         Otherwise it is the focus question above: re-run with the")
+		print("         caret in a text field.")
+		return 1
+
+	if gap:
+		wanted, contained = gap
+		print(f"VERDICT: this process was told GTK_IM_MODULE={wanted}, and there is no")
+		print(f"         im-{wanted}.so anywhere it can reach one. GTK never built an")
+		print("         IBus context at all; every key went to GtkIMContextSimple.")
+		print()
+
+		if contained:
+			print("         It runs in a container with its own /usr, and the session's")
+			print("         GTK_IM_MODULE is inherited straight into it. Steam's client")
+			print("         UI is the case that does this: pressure-vessel's runtime")
+			print("         ships im-xim.so and no ibus module.")
+			print()
+			print("         Fix: route it to XIM, which the container does have.")
+			print("             ime-launch --wrap-desktop steam    # then restart Steam")
+		else:
+			print("         Fix: install that module -- `ibus-health` lists which")
+			print("         toolkits are covered here -- or route this program to a")
+			print("         module that does exist:")
+			print("             ime-launch <the program>")
+
+		return 1
+
+	if route is None and pid:
+		print("VERDICT: no input-method module is loaded in this process at all.")
+		print()
+		print("         It was started without GTK_IM_MODULE/QT_IM_MODULE/XMODIFIERS")
+		print("         set -- launched before login finished, or from a service or")
+		print("         session manager that does not inherit them -- or its toolkit")
+		print("         has no IBus module installed. `ibus-health` lists which")
+		print("         toolkits are covered on this system.")
+		return 1
+
+	if route == "fcitx":
+		print("VERDICT: this process loaded an fcitx module, so it is not talking to")
+		print("         IBus at all. Check GTK_IM_MODULE/QT_IM_MODULE for it.")
+		return 1
+
+	print("VERDICT: no keys reached IBus. Two things do this; check them in order.")
+	print()
+	print("      1. No text field was focused while the probe ran. No toolkit")
+	print("         offers keys to an input method when the caret is not in a")
+	print("         text box, so this is what a healthy program looks like when")
+	print("         probed on, say, its channel list. Put the cursor in a text")
+	print("         field and re-run:")
+	print(f"             ime-probe --watch          # then type in {window['name'][:28]!r}")
+
+	if route == "xim":
+		print()
+		print("         This process is already on the XIM route, which is the one")
+		print("         that works for Electron, so a focus miss is the likely answer.")
+		return 1
+
+	print()
+	print("      2. The application holds an IBus context and ignores it. That is")
+	print("         the Electron/Chromium failure: it opens a context, reports")
+	print("         focus and cursor position into it, and never hands over a")
+	print("         keystroke. Nothing looks broken; input just never happens.")
+	print()
+	print("         Fix: route that program through XIM instead.")
+	print("             ime-launch <the program>")
+	print("         or set GTK_IM_MODULE=xim for it alone.")
+
+	return 1
+
+
+def cmd_list():
+	owners, path = ibus_socket_peers()
+	if not path:
+		die("cannot read the IBus bus address")
+
+	print(f"IBus bus: {path}")
+	print()
+	print(f"{'pid':>7}  {'conns':>5}  process")
+
+	for pid in sorted(owners):
+		try:
+			with open(f"/proc/{pid}/cmdline", "rb") as fh:
+				cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+		except OSError:
+			cmd = "?"
+		print(f"{pid:>7}  {owners[pid]:>5}  {cmd[:70]}")
+
+	return 0
+
+
+class ProcessFacts(TypedDict):
+	"""The static facts audit_process() collects, and audit_verdict() reads."""
+
+	sandboxed: bool
+	env: dict[str, str] | None
+	modules: list[tuple[str, str]]
+	gap: tuple[str, str | None, list[str]] | None
+	chromium: bool
+	contained: bool
+	bus: bool
+
+
+def audit_process(pid, bus_owners) -> ProcessFacts:
+	"""Every static fact that decides whether this process can type Japanese."""
+	facts: ProcessFacts = {
+		"sandboxed": not host_process(pid),
+		"env": {},
+		"modules": [],
+		"gap": None,
+		"chromium": False,
+		"contained": False,
+		"bus": pid in bus_owners,
+	}
+
+	if facts["sandboxed"]:
+		return facts
+
+	facts["env"] = proc_env(pid, {"GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"})
+	facts["modules"] = proc_maps_modules(pid) or []
+	facts["chromium"] = is_chromium_proc(pid)
+	facts["contained"] = proc_mount_ns(pid) not in (None, proc_mount_ns("self"))
+
+	gtk_lib = proc_mapped_lib(pid, "libgtk-3.so")
+	wanted = (facts["env"] or {}).get("GTK_IM_MODULE") or ""
+
+	if gtk_lib and wanted:
+		where, ids = namespace_immodules(pid, gtk_lib)
+		if ids and wanted not in ids:
+			facts["gap"] = (wanted, where, ids)
+
+	return facts
+
+
+def audit_verdict(facts):
+	"""(level, what it is on, what to do about it) for one process."""
+	if facts["sandboxed"]:
+		return "?", "sandboxed; not inspectable from here", "ime-probe --window ID, from inside its own session"
+
+	kinds = {IM_MODULES[base][0] for _, base in facts["modules"]}
+	wanted = (facts["env"] or {}).get("GTK_IM_MODULE")
+
+	if facts["env"] is None:
+		env_note = "environment not readable"
+	elif not wanted:
+		env_note = "GTK_IM_MODULE unset"
+	else:
+		env_note = f"GTK_IM_MODULE={wanted}"
+
+	if facts["gap"]:
+		missing, where, _ = facts["gap"]
+		place = "its container" if facts["contained"] else "this system"
+		return (
+			"FAIL",
+			f"{env_note}, but {place} has no im-{missing}.so",
+			"ime-launch --wrap-desktop <entry>, then restart it",
+		)
+
+	if "fcitx" in kinds:
+		return "FAIL", "loaded an fcitx module; not talking to IBus at all", "fix GTK_IM_MODULE/QT_IM_MODULE for it"
+
+	if facts["chromium"]:
+		if "xim" in kinds:
+			return "ok", "im-xim.so (Chromium on the XIM route)", None
+		if wanted == "xim":
+			return "ok", "GTK_IM_MODULE=xim; module loads on first text field", None
+		return (
+			"FAIL",
+			f"Chromium/Electron on {env_note}; it will open an IBus context and never send it a key",
+			"ime-launch --wrap-all, then restart it",
+		)
+
+	if "xim" in kinds:
+		return "ok", "im-xim.so (XIM via ibus-x11)", None
+
+	if "ibus" in kinds:
+		return "ok", "native IBus module" + (" + own bus connection" if facts["bus"] else ""), None
+
+	if facts["bus"]:
+		return "ok", "holds its own IBus connection", None
+
+	if wanted:
+		return "?", f"{env_note}; no module loaded yet (nothing has focused a text field)", None
+
+	return (
+		"warn",
+		f"{env_note}; nothing here reads an input method",
+		"start it from a session that has the IM variables",
+	)
+
+
+def client_windows():
+	"""The window manager's own list of managed windows."""
+	return re.findall(r"0x[0-9a-f]+", run("xprop", "-root", "_NET_CLIENT_LIST"))
+
+
+def cmd_audit():
+	wids = client_windows()
+	if not wids:
+		die("no _NET_CLIENT_LIST on the root window; is a window manager running?")
+
+	owners, _ = ibus_socket_peers()
+
+	rows = {}
+	for wid in wids:
+		pid = run("xdotool", "getwindowpid", wid)
+		cls = re.findall(r'"([^"]+)"', run("xprop", "-id", wid, "WM_CLASS"))
+		name = run("xdotool", "getwindowname", wid)
+		if not pid.isdigit():
+			continue
+
+		key = (int(pid), cls[-1] if cls else "(none)")
+		row = rows.setdefault(key, {"windows": 0, "name": name})
+		row["windows"] += 1
+
+	print(f"{'':6s} {'win':>3s}  {'pid':>7s}  {'class':22s} route")
+
+	problems = []
+	for (pid, cls), row in sorted(rows.items(), key=lambda kv: kv[0][1].lower()):
+		facts = audit_process(pid, owners)
+		level, what, fix = audit_verdict(facts)
+
+		print(f"[{level:^4s}] {row['windows']:>3d}  {pid:>7d}  {cls[:22]:22s} {what}")
+		if level in ("FAIL", "warn"):
+			problems.append((level, cls, row["name"], what, fix))
+
+	print()
+
+	if not problems:
+		print("Every window on this desktop is on a route that reaches IBus.")
+		print("A window that types nothing anyway is a Mozc mode or keymap")
+		print("question: `kana-switch status`, then `ime-probe --watch` on it.")
+		return 0
+
+	for level, cls, name, what, fix in problems:
+		print(f"{level}: {cls}  {name[:40]!r}")
+		print(f"      {what}")
+		if fix:
+			print(f"      {fix}")
+
+	return 1
+
+
+def main(argv):
+	if "--help" in argv or "-h" in argv:
+		print((__doc__ or "").strip())
+		return 0
+
+	need("xdotool")
+	need("dbus-monitor")
+
+	if "--list" in argv:
+		return cmd_list()
+
+	if "--audit" in argv:
+		return cmd_audit()
+
+	wid = None
+	if "--window" in argv:
+		i = argv.index("--window")
+		if i + 1 >= len(argv):
+			die("--window needs a window id")
+		wid = argv[i + 1]
+
+	watch = "--watch" in argv
+	seconds = WATCH_SECONDS if watch else INJECT_SECONDS
+	if watch:
+		i = argv.index("--watch")
+		if i + 1 < len(argv) and argv[i + 1].replace(".", "", 1).isdigit():
+			seconds = float(argv[i + 1])
+
+	previous = focused_window()
+	wid = wid or previous
+	if not wid:
+		die("no focused window; pass --window ID")
+
+	window = window_facts(wid)
+
+	try:
+		if watch:
+			print(f"Watching the IBus bus for {seconds:g}s.")
+			print(f"Put the cursor in a text field in {window['name']!r} and type now...")
+			print()
+			counts = watch_bus(seconds, action=None)
+			return report(window, counts, injected=False)
+
+		# Injecting only makes sense into the window that has the keyboard.
+		if wid != previous:
+			run("xdotool", "windowactivate", "--sync", wid)
+			time.sleep(0.5)
+
+		print("Probing. This only means anything with the caret already in a text")
+		print("field -- no toolkit offers keys to an input method otherwise.")
+		print()
+
+		counts = watch_bus(seconds, action=inject_probe)
+		return report(window, counts, injected=True)
+	finally:
+		if previous and wid != previous:
+			run("xdotool", "windowactivate", previous)
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv[1:]))

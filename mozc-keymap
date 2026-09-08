@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import NoReturn
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mozc", "config1.db")
 
@@ -16,7 +17,7 @@ HEADER = "status\tkey\tcommand"
 WIRE_VARINT, WIRE_64, WIRE_BYTES, WIRE_32 = 0, 1, 2, 5
 
 
-def die(msg):
+def die(msg: str) -> NoReturn:
 	print(f"mozc-keymap: {msg}", file=sys.stderr)
 	sys.exit(1)
 
@@ -58,12 +59,12 @@ def parse(buf):
 			_, pos = read_varint(buf, pos)
 			value = buf[start:pos]
 		elif wire == WIRE_64:
-			value, pos = buf[pos:pos + 8], pos + 8
+			value, pos = buf[pos : pos + 8], pos + 8
 		elif wire == WIRE_BYTES:
 			length, pos = read_varint(buf, pos)
-			value, pos = buf[pos:pos + length], pos + length
+			value, pos = buf[pos : pos + length], pos + length
 		elif wire == WIRE_32:
-			value, pos = buf[pos:pos + 4], pos + 4
+			value, pos = buf[pos : pos + 4], pos + 4
 		else:
 			raise ValueError(f"unsupported wire type {wire} for field {number}")
 
@@ -125,7 +126,9 @@ def check(text, source):
 
 		# Mozc silently keeps the last binding for a repeated (state, key).
 		if (state, key) in seen:
-			die(f"{source}:{n}: {state}\t{key} is already bound on line {seen[(state, key)]}; Mozc would silently keep only the last one")
+			die(
+				f"{source}:{n}: {state}\t{key} is already bound on line {seen[(state, key)]}; Mozc would silently keep only the last one"
+			)
 
 		seen[(state, key)] = n
 

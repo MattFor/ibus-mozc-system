@@ -1,0 +1,489 @@
+#!/bin/sh
+
+# Run a program with the IM routing it actually works with.
+#
+#   ime-launch COMMAND [ARGS...]         pick the route automatically
+#   ime-launch --route xim COMMAND ...   force XIM (via ibus-x11)
+#   ime-launch --route ibus COMMAND ...  force the native IBus module
+#   ime-launch --detect COMMAND          print the route and exit
+#   ime-launch --wrap-desktop NAME       route NAME.desktop through this
+#   ime-launch --unwrap-desktop NAME     undo that
+#   ime-launch --wrap-all [--dry-run]    wrap every entry that needs the route
+
+set -eu
+
+ROUTE=auto
+DETECT=0
+MODE=run
+ENTRY=
+DRY=0
+STAMP="$(date +%Y%m%d%H%M%S)"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --route)
+            [ $# -ge 2 ] || {
+                echo "ime-launch: --route needs a value" >&2
+                exit 2
+            }
+            ROUTE="$2"
+            shift 2
+            ;;
+        --route=*)
+            ROUTE="${1#--route=}"
+            shift
+            ;;
+        --detect)
+            DETECT=1
+            shift
+            ;;
+        --wrap-desktop)
+            [ $# -ge 2 ] || {
+                echo "ime-launch: --wrap-desktop needs a name" >&2
+                exit 2
+            }
+            MODE=wrap
+            ENTRY="$2"
+            shift 2
+            ;;
+        --wrap-desktop=*)
+            MODE=wrap
+            ENTRY="${1#--wrap-desktop=}"
+            shift
+            ;;
+        --unwrap-desktop)
+            [ $# -ge 2 ] || {
+                echo "ime-launch: --unwrap-desktop needs a name" >&2
+                exit 2
+            }
+            MODE=unwrap
+            ENTRY="$2"
+            shift 2
+            ;;
+        --unwrap-desktop=*)
+            MODE=unwrap
+            ENTRY="${1#--unwrap-desktop=}"
+            shift
+            ;;
+        --wrap-all)
+            MODE=wrapall
+            shift
+            ;;
+        --dry-run | -n)
+            DRY=1
+            shift
+            ;;
+        --help | -h)
+            sed -n '3,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "ime-launch: unknown option $1 (try --help)" >&2
+            exit 2
+            ;;
+        *) break ;;
+    esac
+done
+
+case "$ROUTE" in
+    auto | xim | ibus) ;;
+    *)
+        echo "ime-launch: --route must be auto, xim or ibus" >&2
+        exit 2
+        ;;
+esac
+
+# Resolve a command to a real path so the Chromium markers can be looked for next to it.
+resolve() {
+    case "$1" in
+        */*) resolved="$1" ;;
+        *) resolved="$(command -v "$1" 2>/dev/null || printf '%s' "$1")" ;;
+    esac
+
+    while [ -L "$resolved" ]; do
+        link="$(readlink "$resolved")"
+        case "$link" in
+            /*) resolved="$link" ;;
+            *) resolved="$(dirname "$resolved")/$link" ;;
+        esac
+    done
+
+    printf '%s\n' "$resolved"
+}
+
+first_program() {
+    line="$1"
+
+    while [ -n "$line" ]; do
+        case "$line" in
+            \"*)
+                rest="${line#\"}"
+                tok="${rest%%\"*}"
+                line="${rest#*\"}"
+                line="${line# }"
+                ;;
+            *)
+                tok="${line%% *}"
+                case "$line" in *" "*) line="${line#* }" ;; *) line="" ;; esac
+                ;;
+        esac
+
+        case "$tok" in
+            env | /bin/env | /usr/bin/env) ;;
+            -u) line="${line#* }" ;;
+            -*) ;;
+            *=*) ;;
+            "") ;;
+            *)
+                printf '%s\n' "$tok"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+has_chromium_markers() {
+    # Electron ships the first four; CEF hosts (Steam, Spotify) the rest.
+    for marker in chrome_crashpad_handler v8_context_snapshot.bin resources/app.asar \
+        libffmpeg.so libcef.so icudtl.dat snapshot_blob.bin chrome-sandbox; do
+        [ -e "$1/$marker" ] && return 0
+    done
+    return 1
+}
+
+embeds_chromium() {
+    has_chromium_markers "$(dirname "$1")" && return 0
+
+    if [ -f "$1" ] && head -c 65536 "$1" 2>/dev/null \
+        | grep -qiE 'electron|app\.asar|chromium|crashpad|updater_bootstrap|libcef|steamwebhelper|ubuntu12_(32|64)'; then
+        return 0
+    fi
+
+    name="$(basename "$1")"
+    for candidate in "${XDG_CONFIG_HOME:-$HOME/.config}/$name"/app-*/ \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/$(printf '%s' "$name" | tr 'A-Z' 'a-z')"/app-*/; do
+        [ -d "$candidate" ] && has_chromium_markers "${candidate%/}" && return 0
+    done
+
+    flat="$(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr -d ' _-')"
+    for candidate in "${XDG_CONFIG_HOME:-$HOME/.config}"/*/; do
+        [ -d "$candidate" ] || continue
+
+        if [ -d "$candidate/Local Storage/leveldb" ] || [ -d "$candidate/GPUCache" ] \
+            || [ -d "$candidate/Code Cache" ] || { [ -f "$candidate/Preferences" ] && [ -d "$candidate/Cache" ]; }; then
+            other="$(basename "$candidate" | tr 'A-Z' 'a-z' | tr -d ' _-')"
+            [ ${#other} -ge 4 ] || continue
+
+            case "$flat" in "$other"*) return 0 ;; esac
+            case "$other" in "$flat"*) return 0 ;; esac
+        fi
+    done
+
+    case "$name" in
+        steam | steam-native | steam-runtime | bin_steam.sh)
+            for tree in "${XDG_DATA_HOME:-$HOME/.local/share}/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
+                [ -e "$tree/ubuntu12_64/libcef.so" ] && return 0
+            done
+            [ -e "/usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz" ] && return 0
+            ;;
+    esac
+
+    return 1
+}
+
+route_for() {
+    if embeds_chromium "$1"; then printf 'xim\n'; else printf 'ibus\n'; fi
+}
+
+route_for_exec() {
+    prog="$(first_program "$1" || true)"
+    [ -n "$prog" ] || return 1
+    printf '%s\t%s\n' "$(route_for "$(resolve "$prog")")" "$prog"
+}
+
+MARKER='# Exec lines routed through ime-launch by ibus-mozc-system.'
+
+desktop_home() { printf '%s/applications\n' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
+
+find_desktop_system() {
+    old_ifs="$IFS"
+    IFS=:
+    for dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+        IFS="$old_ifs"
+        if [ -f "$dir/applications/$1.desktop" ]; then
+            printf '%s\n' "$dir/applications/$1.desktop"
+            return 0
+        fi
+        IFS=:
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+refresh_desktop_db() {
+    command -v update-desktop-database >/dev/null 2>&1 || return 0
+    update-desktop-database "$1" >/dev/null 2>&1 \
+        || echo "  note: update-desktop-database failed; the MIME cache in that directory was not rebuilt"
+}
+
+# 0 wrapped, 2 already wrapped, 1 nothing to wrap.
+wrap_desktop() {
+    id="${1%.desktop}"
+    dir="$(desktop_home)"
+    dest="$dir/$id.desktop"
+
+    if src="$(find_desktop_system "$id")"; then
+        :
+    elif [ -f "$dest" ]; then
+        src="$dest" # the application ships only a user-level entry
+    else
+        echo "ime-launch: no $id.desktop under XDG_DATA_DIRS or in $dir" >&2
+        return 1
+    fi
+
+    grep -q '^Exec=.*ime-launch' "$dest" 2>/dev/null && return 2
+
+    if [ "$DRY" = 1 ]; then
+        echo "would wrap $src"
+        return 0
+    fi
+
+    launcher="$(command -v ime-launch 2>/dev/null || true)"
+    [ -x "$HOME/.local/bin/ime-launch" ] && launcher="$HOME/.local/bin/ime-launch"
+    if [ -z "$launcher" ]; then
+        case "$0" in
+            /*) launcher="$0" ;;
+            *) launcher="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+        esac
+    fi
+
+    mkdir -p "$dir"
+    if [ -f "$dest" ]; then
+        cp -p "$dest" "$dest.bak-$STAMP"
+        echo "  backed up $dest -> $dest.bak-$STAMP"
+    fi
+
+    tmp="$dir/.$id.desktop.$$"
+    {
+        printf '%s\n' "$MARKER"
+        printf '# Undo with:  ime-launch --unwrap-desktop %s\n' "$id"
+        sed "s|^Exec=|Exec=$launcher |" "$src"
+    } >"$tmp"
+    mv "$tmp" "$dest"
+    chmod 644 "$dest"
+
+    echo "wrapped $src"
+    echo "     -> $dest"
+
+    refresh_desktop_db "$dir"
+    return 0
+}
+
+restart_note() {
+    echo "  a program already running keeps the environment it was started with;"
+    echo "  quit it fully and start it again from the menu for this to take."
+}
+
+# Every entry on the system, id by id, user copies shadowing system ones.
+desktop_ids() {
+    old_ifs="$IFS"
+    IFS=:
+    set -- ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+    IFS="$old_ifs"
+
+    for dir in "$@" "${XDG_DATA_HOME:-$HOME/.local/share}"; do
+        for file in "$dir"/applications/*.desktop; do
+            [ -f "$file" ] || continue
+            base="$(basename "$file" .desktop)"
+            printf '%s\n' "$base"
+        done
+    done | sort -u
+}
+
+wrap_flatpaks() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+
+    for app in $(flatpak list --app --columns=application 2>/dev/null); do
+        loc="$(flatpak info --show-location "$app" 2>/dev/null || true)"
+        [ -n "$loc" ] && [ -d "$loc/files" ] || continue
+
+        found=""
+        for marker in chrome_crashpad_handler libcef.so libffmpeg.so snapshot_blob.bin resources/app.asar; do
+            [ -n "$(find "$loc/files" -maxdepth 5 -name "$marker" -print -quit 2>/dev/null)" ] \
+                && {
+                    found=1
+                    break
+                }
+        done
+        [ -n "$found" ] || continue
+
+        if flatpak override --user --show "$app" 2>/dev/null | grep -q '^GTK_IM_MODULE='; then
+            printf '  %-34s already has its own override\n' "$app"
+            continue
+        fi
+
+        if [ "$DRY" = 1 ]; then
+            printf '  %-34s would get GTK_IM_MODULE=xim\n' "$app"
+            continue
+        fi
+
+        if flatpak override --user --env=GTK_IM_MODULE=xim "$app" 2>/dev/null; then
+            printf '  %-34s GTK_IM_MODULE=xim (flatpak override)\n' "$app"
+        else
+            printf '  %-34s flatpak override failed\n' "$app"
+        fi
+    done
+
+    return 0
+}
+
+wrap_all() {
+    dir="$(desktop_home)"
+    list="${TMPDIR:-/tmp}/ime-launch-ids.$$"
+    wrapped=0
+    already=0
+    itself=0
+
+    desktop_ids >"$list"
+
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+
+        if src="$(find_desktop_system "$id")"; then
+            :
+        elif [ -f "$dir/$id.desktop" ]; then
+            src="$dir/$id.desktop"
+        else
+            continue
+        fi
+
+        # A user copy that is already routed settles that id, whatever the system entry underneath it says.
+        if grep -q '^Exec=.*ime-launch' "$dir/$id.desktop" 2>/dev/null; then
+            already=$((already + 1))
+            continue
+        fi
+
+        line="$(sed -n 's/^Exec=//p' "$src" | head -1)"
+        [ -n "$line" ] || continue
+
+        prog="$(first_program "$line" || true)"
+        [ -n "$prog" ] || continue
+
+        target="$(resolve "$prog")"
+        [ "$(route_for "$target")" = xim ] || continue
+
+        # A launcher script that already calls ime-launch routes itself; a wrapper around it would only set the same variables twice.
+        if [ -f "$target" ] && head -c 65536 "$target" 2>/dev/null | grep -q 'ime-launch'; then
+            printf '  %-34s routes itself\n' "$id"
+            itself=$((itself + 1))
+            continue
+        fi
+
+        set +e
+        wrap_desktop "$id" >/dev/null
+        status=$?
+        set -e
+
+        if [ "$status" = 0 ]; then
+            printf '  %-34s %s\n' "$id" "$([ "$DRY" = 1 ] && echo 'would be routed to xim' || echo 'routed to xim')"
+            wrapped=$((wrapped + 1))
+        fi
+    done <"$list"
+
+    rm -f "$list"
+
+    wrap_flatpaks
+
+    printf '%d entr%s %s, %d already routed, %d self-routing\n' \
+        "$wrapped" "$([ "$wrapped" = 1 ] && echo y || echo ies)" \
+        "$([ "$DRY" = 1 ] && echo 'would be wrapped' || echo wrapped)" "$already" "$itself"
+
+    [ "$DRY" = 1 ] || [ "$wrapped" = 0 ] || restart_note
+    return 0
+}
+
+unwrap_desktop() {
+    id="${1%.desktop}"
+    dir="$(desktop_home)"
+    dest="$dir/$id.desktop"
+
+    [ -f "$dest" ] || {
+        echo "ime-launch: $dest does not exist" >&2
+        exit 1
+    }
+    grep -q '^Exec=.*ime-launch' "$dest" \
+        || {
+            echo "ime-launch: $dest is not wrapped; leaving it alone" >&2
+            exit 1
+        }
+
+    if find_desktop_system "$id" >/dev/null; then
+        rm -f "$dest"
+        echo "removed $dest (the system entry takes over again)"
+    else
+        tmp="$dir/.$id.desktop.$$"
+        grep -v -e "^$MARKER\$" -e '^# Undo with:  ime-launch ' "$dest" \
+            | sed 's|^Exec=[^ ]*ime-launch ||' >"$tmp"
+        mv "$tmp" "$dest"
+        chmod 644 "$dest"
+        echo "unwrapped $dest"
+    fi
+
+    refresh_desktop_db "$dir"
+}
+
+case "$MODE" in
+    wrap)
+        set +e
+        wrap_desktop "$ENTRY"
+        status=$?
+        set -e
+        case "$status" in
+            0) [ "$DRY" = 1 ] || restart_note ;;
+            2) echo "already wrapped: $(desktop_home)/${ENTRY%.desktop}.desktop" ;;
+            *) exit "$status" ;;
+        esac
+        exit 0
+        ;;
+    unwrap)
+        unwrap_desktop "$ENTRY"
+        exit 0
+        ;;
+    wrapall)
+        wrap_all
+        exit 0
+        ;;
+esac
+
+[ $# -ge 1 ] || {
+    echo "ime-launch: no command given (try --help)" >&2
+    exit 2
+}
+
+target="$(resolve "$1")"
+
+[ "$ROUTE" = auto ] && ROUTE="$(route_for "$target")"
+
+if [ "$DETECT" = 1 ]; then
+    printf '%s\t%s\n' "$ROUTE" "$target"
+    exit 0
+fi
+
+export XMODIFIERS=@im=ibus
+export QT_IM_MODULE=ibus
+export SDL_IM_MODULE=ibus
+export GLFW_IM_MODULE=ibus
+
+if [ "$ROUTE" = xim ]; then
+    export GTK_IM_MODULE=xim
+else
+    export GTK_IM_MODULE=ibus
+fi
+
+exec "$@"

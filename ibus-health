@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import glob
 import ctypes
+import glob
+import os
+import shutil
 import subprocess
+import sys
 
 if "--help" in sys.argv or "-h" in sys.argv:
-	print(__doc__.strip())
+	print((__doc__ or "").strip())
 	sys.exit(0)
 
 QUIET = "--quiet" in sys.argv or "-q" in sys.argv
@@ -20,8 +21,10 @@ def say(*a):
 		print(*a, flush=True)
 
 
-problems = []
-toolkit_problems = []
+problems = []  # broken now, and this project can fix it
+toolkit_problems = []  # broken now, and it cannot -- a packaging bug
+config_problems = []  # configured correctly on disk, not in THIS session yet
+route_problems = []  # the stack is fine; one program is started the wrong way
 
 # 1. global engine. IBus clears it when the engine dies and never re-sets it.
 try:
@@ -35,12 +38,63 @@ else:
 	problems.append("engine")
 
 # 2. ibus-x11. ibus-daemon starts it once and never restarts it.
-xim_running = subprocess.run(["pgrep", "-x", "ibus-x11"], capture_output=True).returncode == 0
-if xim_running:
+xim_pids = subprocess.run(["pgrep", "-x", "ibus-x11"], capture_output=True, text=True).stdout.split()
+if xim_pids:
 	say("[ ok ] ibus-x11 (XIM)    : running")
+
+	suicidal = []
+	for pid in xim_pids:
+		try:
+			with open(f"/proc/{pid}/cmdline", "rb") as fh:
+				if b"--kill-daemon" in fh.read():
+					suicidal.append(pid)
+		except OSError:
+			pass
+
+	if suicidal:
+		say("[warn] ibus-x11 flags   : started with --kill-daemon (pid " + ", ".join(suicidal) + ")")
+		say("                         When the XIM server crashes it takes ibus-daemon")
+		say("                         with it, so one crash costs input everywhere.")
+		say("                         Comes from `ibus-daemon -x`; drop the -x in")
+		say("                         ~/.xprofile and let ibus-mozc-init own ibus-x11.")
+		config_problems.append("ibus-x11 runs with --kill-daemon")
 else:
 	say("[FAIL] ibus-x11 (XIM)    : NOT running")
+	say("                         XIM carries SDL games, Java, Wine AND Electron here.")
 	problems.append("ibus-x11")
+
+# 2b. org.freedesktop.IBus on the SESSION bus.
+if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+	say("[warn] session bus     : DBUS_SESSION_BUS_ADDRESS unset in this shell")
+	say("                         cannot tell whether GTK4 has input from here")
+elif shutil.which("gdbus") is None:
+	say("[warn] session bus     : gdbus not found; cannot check the GTK4 gate")
+else:
+	owner = subprocess.run(
+		[
+			"gdbus",
+			"call",
+			"--session",
+			"--dest",
+			"org.freedesktop.DBus",
+			"--object-path",
+			"/org/freedesktop/DBus",
+			"--method",
+			"org.freedesktop.DBus.GetNameOwner",
+			"org.freedesktop.IBus",
+		],
+		capture_output=True,
+		text=True,
+	)
+	if owner.returncode == 0:
+		say(f"[ ok ] session bus name : org.freedesktop.IBus owned by {owner.stdout.strip().strip("(),'")}")
+	else:
+		say("[FAIL] session bus name : org.freedesktop.IBus has NO OWNER")
+		say("                         GTK4 applications get no keys at all. The daemon")
+		say("                         was started before the session bus existed --")
+		say("                         ~/.xprofile must not start it; the autostart")
+		say("                         entry must. Run ibus-mozc-init to repair.")
+		problems.append("session bus name (GTK4 has no input)")
 
 # 3. XOpenIM().
 libc = ctypes.CDLL("libc.so.6")
@@ -97,6 +151,7 @@ say(f"[info] tracked kana     : {kana}")
 
 # 5. Toolkit.
 if not QUIET:
+
 	def find(*patterns):
 		for pattern in patterns:
 			hits = glob.glob(pattern)
@@ -104,26 +159,48 @@ if not QUIET:
 				return hits[0]
 		return None
 
-
-	def exports(path, symbol):
+	def exports(path, symbols):
 		try:
 			with open(path, "rb") as fh:
-				return symbol.encode() in fh.read()
+				blob = fh.read()
 		except OSError:
 			return False
 
+		return any(sym.encode() in blob for sym in symbols)
 
 	say("")
 
-	for var in ("GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"):
+	for var in ("GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS", "SDL_IM_MODULE"):
 		value = os.environ.get(var)
 		say(f"[{' ok ' if value else 'warn'}] {var:16s}: {value or '(unset)'}")
+		if not value:
+			config_problems.append(f"{var} is unset in this session")
 
 	routes = [
-		("GTK3 apps", find("/usr/lib*/gtk-3.0/*/immodules/im-ibus.so"), "im_module_init", "GTK3, Electron/Chromium, Firefox, VTE terminals"),
-		("GTK4 apps", find("/usr/lib*/gtk-4.0/*/immodules/libim-ibus.so"), "g_io_module_load", "GTK4 apps"),
-		("Qt5 apps", find("/usr/lib*/qt5/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"), None, "Qt5 apps"),
-		("Qt6 apps", find("/usr/lib*/qt6/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"), None, "Qt6 apps"),
+		(
+			"GTK3 apps",
+			find("/usr/lib*/gtk-3.0/*/immodules/im-ibus.so"),
+			"im_module_init",
+			"GTK3, Firefox, VTE terminals",
+		),
+		(
+			"GTK4 apps",
+			find("/usr/lib*/gtk-4.0/*/immodules/libim-ibus.so"),
+			("g_io_module_load", "g_io_im_ibus_load"),
+			"GTK4 apps",
+		),
+		(
+			"Qt5 apps",
+			find("/usr/lib*/qt5/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"),
+			None,
+			"Qt5 apps",
+		),
+		(
+			"Qt6 apps",
+			find("/usr/lib*/qt6/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so"),
+			None,
+			"Qt6 apps",
+		),
 	]
 
 	for label, path, symbol, who in routes:
@@ -132,21 +209,83 @@ if not QUIET:
 			toolkit_problems.append(f"{label} have no IBus module")
 		elif symbol and not exports(path, symbol):
 			say(f"[FAIL] {label:16s}: {path}")
-			say(f"       {'':16s}  does not export {symbol}, so it can never be loaded.")
-			say(f"       {'':16s}  {who} have NO Japanese input. Packaging bug in the")
-			say(f"       {'':16s}  IBus module, not a configuration problem.")
+			say(f"       {'':16s}  exports none of {', '.join(symbol)}, so GLib can")
+			say(f"       {'':16s}  never load it. {who} have NO Japanese input.")
+			say(f"       {'':16s}  Packaging bug in the module, not a configuration one.")
 			toolkit_problems.append(f"{label} have no input method")
 		else:
 			say(f"[ ok ] {label:16s}: {path}")
+
+	xim_module = find("/usr/lib*/gtk-3.0/*/immodules/im-xim.so")
+	if xim_module:
+		say(f"[ ok ] {'Electron apps':16s}: {xim_module}")
+		say(f"       {'':16s}  via ime-launch; Electron opens an IBus context and")
+		say(f"       {'':16s}  never sends it a key, so it is routed to XIM instead.")
+	else:
+		say(f"[FAIL] {'Electron apps':16s}: no GTK XIM module (im-xim.so) installed")
+		say(f"       {'':16s}  Electron/Chromium has no working route without it.")
+		toolkit_problems.append("Electron apps have no XIM module to fall back to")
+
+	data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+	steam_trees = [
+		os.path.join(data_home, "Steam"),
+		os.path.expanduser("~/.steam/steam"),
+		os.path.expanduser("~/.steam/root"),
+	]
+
+	if shutil.which("steam") or any(os.path.isdir(p) for p in steam_trees):
+		entry = os.path.join(data_home, "applications", "steam.desktop")
+		try:
+			with open(entry) as fh:
+				wrapped = any(line.startswith("Exec=") and "ime-launch" in line for line in fh)
+		except OSError:
+			wrapped = False
+
+		if not wrapped:
+			say(f"[warn] {'Steam client UI':16s}: not routed. Its container has no im-ibus.so,")
+			say(f"       {'':16s}  so the client UI gets no input method at all.")
+			say(f"       {'':16s}  Wrap the entry that starts it, then restart Steam:")
+			say(f"       {'':16s}      ime-launch --wrap-desktop steam")
+			route_problems.append("Steam client UI (ime-launch --wrap-desktop steam)")
+		else:
+			say(f"[ ok ] {'Steam client UI':16s}: {entry}")
+			say(f"       {'':16s}  routed through ime-launch")
+
+			live = subprocess.run(["pgrep", "-x", "steamwebhelper"], capture_output=True, text=True).stdout.split()
+			for pid in live[:1]:
+				try:
+					with open(f"/proc/{pid}/environ", "rb") as fh:
+						env = {
+							key: value
+							for key, sep, value in (
+								item.partition("=") for item in fh.read().decode("utf-8", "replace").split("\0")
+							)
+							if sep
+						}
+				except OSError:
+					continue
+
+				if env.get("GTK_IM_MODULE") != "xim":
+					say(f"[warn] {'Steam running':16s}: the client running now started before that,")
+					say(f"       {'':16s}  with GTK_IM_MODULE={env.get('GTK_IM_MODULE') or '(unset)'}. It keeps that")
+					say(f"       {'':16s}  until Steam is fully quit and started again.")
+					route_problems.append("the running Steam client predates the wrapper")
 
 say("")
 
 if problems:
 	say("UNHEALTHY: " + ", ".join(problems))
-elif toolkit_problems:
-	say("healthy, but: " + "; ".join(toolkit_problems))
-	say("(exit code unaffected - not something IBus / this project can repair)")
 else:
-	say("healthy")
+	if config_problems:
+		say("this session predates the current config: " + "; ".join(config_problems))
+		say("(fixed in ~/.xprofile; it takes a new login for this session to catch up)")
+	if toolkit_problems:
+		say("healthy, but: " + "; ".join(toolkit_problems))
+		say("(exit code unaffected - not something IBus / this project can repair)")
+	if route_problems:
+		say("not routed: " + "; ".join(route_problems))
+		say("(exit code unaffected - the stack is fine; that program is not on it)")
+	if not config_problems and not toolkit_problems and not route_problems:
+		say("healthy")
 
 sys.exit(0 if not problems else 1)

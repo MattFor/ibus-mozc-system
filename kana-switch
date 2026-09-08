@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 
+import contextlib
+import ctypes
+import fcntl
 import os
 import sys
 import time
-import fcntl
-import ctypes
-import contextlib
 
 MODES = ("hiragana", "katakana", "half-katakana")
-CARRIER = {"hiragana": "Muhenkan",
-           "katakana": "Hiragana_Katakana",
-           "half-katakana": "Eisu_toggle"}
+CARRIER = {"hiragana": "Muhenkan", "katakana": "Hiragana_Katakana", "half-katakana": "Eisu_toggle"}
 WIDTH_OF = {"katakana": "full", "half-katakana": "half"}
 KATAKANA_AT = {"full": "katakana", "half": "half-katakana"}
 
@@ -47,10 +45,7 @@ KeyCode = ctypes.c_ubyte
 
 
 class XModifierKeymap(ctypes.Structure):
-	_fields_ = [
-		("max_keypermod", ctypes.c_int),
-		("modifiermap", ctypes.POINTER(KeyCode))
-	]
+	_fields_ = [("max_keypermod", ctypes.c_int), ("modifiermap", ctypes.POINTER(KeyCode))]
 
 
 class XKeyboardControl(ctypes.Structure):
@@ -62,7 +57,7 @@ class XKeyboardControl(ctypes.Structure):
 		("led", ctypes.c_int),
 		("led_mode", ctypes.c_int),
 		("key", ctypes.c_int),
-		("auto_repeat_mode", ctypes.c_int)
+		("auto_repeat_mode", ctypes.c_int),
 	]
 
 
@@ -74,7 +69,7 @@ class XKeyboardState(ctypes.Structure):
 		("bell_duration", ctypes.c_uint),
 		("led_mask", ctypes.c_ulong),
 		("global_auto_repeat", ctypes.c_int),
-		("auto_repeats", ctypes.c_ubyte * 32)
+		("auto_repeats", ctypes.c_ubyte * 32),
 	]
 
 
@@ -198,7 +193,11 @@ def have_xtest(dpy):
 			_xtest_ok = False
 		else:
 			ev, err, major, minor = (ctypes.c_int() for _ in range(4))
-			_xtest_ok = bool(xtst.XTestQueryExtension(dpy, ctypes.byref(ev), ctypes.byref(err), ctypes.byref(major), ctypes.byref(minor)))
+			_xtest_ok = bool(
+				xtst.XTestQueryExtension(
+					dpy, ctypes.byref(ev), ctypes.byref(err), ctypes.byref(major), ctypes.byref(minor)
+				)
+			)
 		if not _xtest_ok:
 			log("no XTEST extension; falling back to xdotool")
 
@@ -206,7 +205,7 @@ def have_xtest(dpy):
 
 
 def fake_key(dpy, keycode, press):
-	if not have_xtest(dpy):
+	if xtst is None or not have_xtest(dpy):
 		return False
 
 	xtst.XTestFakeKeyEvent(dpy, keycode, 1 if press else 0, 0)
@@ -276,6 +275,7 @@ def send_keysym(dpy, name, table, per_code, trigger_kcs, stuck_mods):
 
 	if not fake_key(dpy, keycode, True):
 		import subprocess
+
 		x11.XSync(dpy, False)
 		subprocess.run(["xdotool", "key", name], check=False)
 	else:
@@ -334,9 +334,9 @@ def read_state():
 	width = "full"
 	for line in lines[1:]:
 		if line.startswith("session="):
-			stored_fp = line[len("session="):].strip()
+			stored_fp = line[len("session=") :].strip()
 		elif line.startswith("width="):
-			width = line[len("width="):].strip()
+			width = line[len("width=") :].strip()
 
 	if width not in KATAKANA_AT:
 		width = "full"
@@ -509,7 +509,9 @@ def main(argv):
 		apply(action)
 		return 0
 
-	die(f"usage: {os.path.basename(argv[0])} [toggle|width|hiragana|katakana|half-katakana|status|keys|norepeat] [--verbose]")
+	die(
+		f"usage: {os.path.basename(argv[0])} [toggle|width|hiragana|katakana|half-katakana|status|keys|norepeat] [--verbose]"
+	)
 
 	return None
 

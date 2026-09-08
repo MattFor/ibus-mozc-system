@@ -9,29 +9,32 @@ LOCK="${XDG_RUNTIME_DIR:-/tmp}/ibus-mozc-init.lock"
 KANA_STATE="${XDG_RUNTIME_DIR:-/tmp}/mozc-kana-state"
 TIDY_OFF="$HOME/.config/ibus-candidate-tidy.disabled"
 
-BUS_WAIT=60       # Seconds to wait for the ibus daemon to answer at all
-ACTIVATE_WAIT=90  # Seconds to keep trying to select the engine
-CALL_TIMEOUT=5    # Seconds any single ibus call may block
-LOGIN_PHASE=300   # Seconds of fast polling after login
-XMODMAP_PHASE=60  # Seconds of re-applying ~/.Xmodmap after login
-FAST_INTERVAL=5   # Poll period during the login phase
-SLOW_INTERVAL=15  # Poll period for the rest of the session
-DEEP_EVERY=300    # Seconds between full ibus-health probes
+BUS_WAIT=60         # Seconds to wait for the ibus daemon to answer at all
+ACTIVATE_WAIT=90    # Seconds to keep trying to select the engine
+CALL_TIMEOUT=5      # Seconds any single ibus call may block
+LOGIN_PHASE=300     # Seconds of fast polling after login
+XMODMAP_PHASE=60    # Seconds of re-applying ~/.Xmodmap after login
+FAST_INTERVAL=5     # Poll period during the login phase
+SLOW_INTERVAL=15    # Poll period for the rest of the session
+DEEP_EVERY=300      # Seconds between full ibus-health probes
+MAX_SESSION_FIXES=3 # Daemon restarts allowed to claim the session bus name
 
 WATCH=0
 [ "$1" = "--watch" ] && WATCH=1
 
 # Where's ibus-x11?
 XIM_BIN=""
-for candidate in                            \
-    "$IBUS_X11_BIN"                         \
-    /usr/libexec/ibus-x11                   \
-    /usr/lib/ibus/ibus-x11                  \
-    /usr/lib64/ibus/ibus-x11                \
+for candidate in \
+    "$IBUS_X11_BIN" \
+    /usr/libexec/ibus-x11 \
+    /usr/lib/ibus/ibus-x11 \
+    /usr/lib64/ibus/ibus-x11 \
     /usr/lib/x86_64-linux-gnu/ibus/ibus-x11 \
-    /usr/local/libexec/ibus-x11
-do
-    [ -n "$candidate" ] && [ -x "$candidate" ] && { XIM_BIN="$candidate"; break; }
+    /usr/local/libexec/ibus-x11; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && {
+        XIM_BIN="$candidate"
+        break
+    }
 done
 
 TIDY_BIN="$(dirname "$0")/ibus-candidate-tidy"
@@ -76,7 +79,7 @@ if [ "$WATCH" = 1 ]; then
 fi
 
 engine_now() { timeout "$CALL_TIMEOUT" ibus engine 2>/dev/null; }
-set_engine()  { timeout "$CALL_TIMEOUT" ibus engine "$ENGINE" >/dev/null 2>&1; }
+set_engine() { timeout "$CALL_TIMEOUT" ibus engine "$ENGINE" >/dev/null 2>&1; }
 
 x_alive() { xset q >/dev/null 2>&1; }
 
@@ -110,8 +113,7 @@ ensure_tidy() {
     [ -n "$TIDY_BIN" ] && [ -x "$TIDY_BIN" ] || return 0
     [ -f "$TIDY_OFF" ] && return 0
 
-    # The bracket stops the pattern matching a shell whose command line contains the name.
-    pgrep -f 'ibus-candidate[-]tidy' >/dev/null 2>&1 && return 0
+    pgrep -f "^[^ ]*python[^ ]* $TIDY_BIN" >/dev/null 2>&1 && return 0
     setsid nohup "$TIDY_BIN" >/dev/null 2>&1 </dev/null 9>&- &
 
     log "started ibus-candidate-tidy"
@@ -131,22 +133,70 @@ ensure_xim() {
 }
 
 start_daemon() {
-    # -d is the only form verified to survive a detached launch.
-    ibus-daemon -drxR >>"$DAEMON_LOG" 2>&1 9>&-
+    ibus-daemon -drR >>"$DAEMON_LOG" 2>&1 9>&-
+}
+
+session_name_owned() {
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
+    command -v gdbus >/dev/null 2>&1 || return 0 # Cannot tell; do not thrash
+
+    timeout "$CALL_TIMEOUT" gdbus call --session \
+        --dest org.freedesktop.DBus \
+        --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner \
+        org.freedesktop.IBus >/dev/null 2>&1
+}
+
+ensure_session_bus() {
+    pgrep -x ibus-daemon >/dev/null 2>&1 || return 0
+    session_name_owned && return 0
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        log "WARNING: no DBUS_SESSION_BUS_ADDRESS in this process, so a daemon"
+        log "         started without the session bus cannot be repaired from"
+        log "         here. GTK4 applications will get no input."
+        return 1
+    fi
+
+    session_fixes=$((session_fixes + 1))
+    if [ "$session_fixes" -gt "$MAX_SESSION_FIXES" ]; then
+        log "giving up on the session bus name after $MAX_SESSION_FIXES restarts"
+        return 1
+    fi
+
+    log "ibus-daemon does not own org.freedesktop.IBus on the session bus"
+    log "  -- GTK4 applications get no keys at all -- restarting it (fix #$session_fixes)"
+
+    pkill -x ibus-daemon 2>/dev/null
+    sleep 2
+    start_daemon
+    sleep 3
+    rm -f "$KANA_STATE"
+
+    if session_name_owned; then
+        log "session bus name claimed; GTK4 input works again"
+    else
+        log "WARNING: org.freedesktop.IBus still has no owner on the session bus"
+    fi
 }
 
 log "Start (watch=$WATCH)"
 [ -n "$XIM_BIN" ] || log "WARNING: ibus-x11 not found in any known location"
 
-# 1. Daemon must exist; .xprofile normally starts it.
+session_fixes=0
+
+# 1. Daemon must exist.
 if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
     log "no ibus-daemon, starting one"
     start_daemon
     sleep 2
 fi
 
+# 1b. A daemon that predates the session bus has to be replaced, not adopted.
+ensure_session_bus
+
 # 2. Wait for the bus.
-deadline=$(( $(now) + BUS_WAIT ))
+deadline=$(($(now) + BUS_WAIT))
 while :; do
     timeout "$CALL_TIMEOUT" ibus list-engine >/dev/null 2>&1 && break
     if [ "$(now)" -ge "$deadline" ]; then
@@ -159,7 +209,7 @@ done
 log "bus answered"
 
 # 3. Select Mozc.
-deadline=$(( $(now) + ACTIVATE_WAIT ))
+deadline=$(($(now) + ACTIVATE_WAIT))
 while [ "$(engine_now)" != "$ENGINE" ]; do
     set_engine
     if [ "$(now)" -ge "$deadline" ]; then
@@ -218,7 +268,7 @@ while :; do
         engine_fixes=$((engine_fixes + 1))
         log "global engine was cleared at ${elapsed}s (repair #$engine_fixes) [$(context)], re-setting $ENGINE"
         set_engine
-        rm -f "$KANA_STATE"   # A rebuilt engine comes back in hiragana
+        rm -f "$KANA_STATE" # A rebuilt engine comes back in hiragana
     fi
 
     if ! pgrep -x ibus-x11 >/dev/null 2>&1; then
@@ -236,6 +286,7 @@ while :; do
         since_deep=0
         trim_log "$LOG" 2000 500
         trim_log "$XIM_LOG" 2000 500
+        ensure_session_bus
         if command -v ibus-health >/dev/null 2>&1 && ! ibus-health --quiet; then
             log "deep probe failed while the cheap checks passed, restarting XIM server"
             pkill -x ibus-x11 2>/dev/null

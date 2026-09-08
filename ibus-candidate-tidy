@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import time
 import ctypes
+import os
+import select
+import sys
 
 HEIGHT_MAX = int(os.environ.get("IBUS_TIDY_HEIGHT_MAX", "60"))
-POLL = float(os.environ.get("IBUS_TIDY_POLL", "0.12"))
-CONFIRMATIONS = 2
+
+SWEEP = float(os.environ.get("IBUS_TIDY_SWEEP", os.environ.get("IBUS_TIDY_POLL", "2.0")))
+
 OFFSCREEN = (-10000, -10000)
+PARKED_X = -1000  # Anything left of this is from this program or already hidden
+
 VERBOSE = "--verbose" in sys.argv
+
+MapNotify, UnmapNotify, DestroyNotify, ConfigureNotify = 19, 18, 17, 22
+SubstructureNotifyMask = 1 << 19
+IsViewable = 2
 
 x11 = ctypes.CDLL("libX11.so.6")
 Display, Window = ctypes.c_void_p, ctypes.c_ulong
@@ -39,30 +46,100 @@ class XWA(ctypes.Structure):
 		("your_event_mask", ctypes.c_long),
 		("do_not_propagate_mask", ctypes.c_long),
 		("override_redirect", ctypes.c_int),
-		("screen", ctypes.c_void_p)
+		("screen", ctypes.c_void_p),
 	]
 
 
 class XClassHint(ctypes.Structure):
-	# c_void_p, not c_char_p: ctypes turns a c_char_p field into bytes and drops
-	# the pointer, so the two strings XGetClassHint() mallocs could never be
-	# freed causing two leaked allocations per poll, all session.
 	_fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+class XAnyEvent(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("window", Window),
+	]
+
+
+class XConfigureEvent(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("event", Window),
+		("window", Window),
+		("x", ctypes.c_int),
+		("y", ctypes.c_int),
+		("width", ctypes.c_int),
+		("height", ctypes.c_int),
+		("border_width", ctypes.c_int),
+		("above", Window),
+		("override_redirect", ctypes.c_int),
+	]
+
+
+class XMapEvent(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("event", Window),
+		("window", Window),
+		("override_redirect", ctypes.c_int),
+	]
+
+
+class XDestroyWindowEvent(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("event", Window),
+		("window", Window),
+	]
+
+
+class XEvent(ctypes.Union):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("any", XAnyEvent),
+		("configure", XConfigureEvent),
+		("map", XMapEvent),
+		("destroy", XDestroyWindowEvent),
+		("pad", ctypes.c_long * 24),
+	]
 
 
 ERRH = ctypes.CFUNCTYPE(ctypes.c_int, Display, ctypes.c_void_p)
 x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = Display, [ctypes.c_char_p]
 x11.XDefaultRootWindow.restype, x11.XDefaultRootWindow.argtypes = Window, [Display]
-x11.XQueryTree.argtypes = [Display, Window, ctypes.POINTER(Window), ctypes.POINTER(Window), ctypes.POINTER(ctypes.POINTER(Window)), ctypes.POINTER(ctypes.c_uint)]
+x11.XQueryTree.argtypes = [
+	Display,
+	Window,
+	ctypes.POINTER(Window),
+	ctypes.POINTER(Window),
+	ctypes.POINTER(ctypes.POINTER(Window)),
+	ctypes.POINTER(ctypes.c_uint),
+]
 x11.XGetWindowAttributes.argtypes = [Display, Window, ctypes.POINTER(XWA)]
 x11.XGetClassHint.argtypes = [Display, Window, ctypes.POINTER(XClassHint)]
 x11.XMoveWindow.argtypes = [Display, Window, ctypes.c_int, ctypes.c_int]
+x11.XSelectInput.argtypes = [Display, Window, ctypes.c_long]
+x11.XNextEvent.argtypes = [Display, ctypes.POINTER(XEvent)]
+x11.XPending.restype, x11.XPending.argtypes = ctypes.c_int, [Display]
+x11.XConnectionNumber.restype, x11.XConnectionNumber.argtypes = ctypes.c_int, [Display]
 x11.XFlush.argtypes = [Display]
 x11.XFree.argtypes = [ctypes.c_void_p]
 x11.XSetErrorHandler.restype = ctypes.c_void_p
 x11.XSetErrorHandler.argtypes = [ERRH]
 
-# The candidate window is destroyed and recreated freely; querying one that has just gone must not print Xlib noise or abort this process.
+# The candidate window is destroyed and recreated freely
 _keep = ERRH(lambda d, e: 0)
 x11.XSetErrorHandler(_keep)
 
@@ -87,7 +164,7 @@ def attrs(win):
 	return a
 
 
-def is_candidate(win):
+def is_ibus_panel(win):
 	ch = XClassHint()
 
 	if not x11.XGetClassHint(dpy, win, ctypes.byref(ch)):
@@ -104,54 +181,95 @@ def is_candidate(win):
 	return "ibus-ui-gtk3" in name.lower() or "ibus-ui-gtk3" in cls.lower()
 
 
-def find_candidate():
+_known = {}
+
+
+def is_candidate(win):
+	hit = _known.get(win)
+	if hit is None:
+		a = attrs(win)
+		hit = bool(a and a.override_redirect and is_ibus_panel(win))
+		_known[win] = hit
+
+	return hit
+
+
+_home = {}
+
+
+def consider(win, x, y, height):
+	if not is_candidate(win):
+		return
+
+	if height >= HEIGHT_MAX:
+		if x <= PARKED_X:
+			home = _home.get(win)
+			if home:
+				x11.XMoveWindow(dpy, win, home[0], home[1])
+				x11.XFlush(dpy)
+				log(f"restored 0x{win:08x} to {home[0]},{home[1]} ({height}px of candidates)")
+		else:
+			_home[win] = (x, y)
+		return
+
+	# Empty box
+	if x > PARKED_X:
+		_home[win] = (x, y)
+		x11.XMoveWindow(dpy, win, *OFFSCREEN)
+		x11.XFlush(dpy)
+		log(f"parked leftover {height}px window 0x{win:08x} from {x},{y}")
+
+
+def sweep():
 	r, p = Window(), Window()
 	kids = ctypes.POINTER(Window)()
 	n = ctypes.c_uint()
 
 	if not x11.XQueryTree(dpy, root, ctypes.byref(r), ctypes.byref(p), ctypes.byref(kids), ctypes.byref(n)):
-		return None
+		return
 
-	found = None
 	for i in range(n.value):
 		w = kids[i]
 		a = attrs(w)
-		if a and a.map_state == 2 and a.override_redirect and is_candidate(w):
-			found = w
-			break
+		if a and a.map_state == IsViewable and a.override_redirect:
+			consider(w, a.x, a.y, a.height)
 
 	if kids:
 		x11.XFree(kids)
 
-	return found
 
+x11.XSelectInput(dpy, root, SubstructureNotifyMask)
+x11.XFlush(dpy)
+sweep()
 
-win = None
-small_seen = 0
-log(f"started (height_max={HEIGHT_MAX} poll={POLL}s)")
+log(f"started (height_max={HEIGHT_MAX} sweep={SWEEP}s, event-driven)")
+
+fd = x11.XConnectionNumber(dpy)
+event = XEvent()
 
 while True:
-	a = attrs(win) if win else None
-	if a is None or a.map_state != 2:
-		win = find_candidate()
-		small_seen = 0
-		time.sleep(POLL)
+	# Drain everything queued before going back to sleep
+	while x11.XPending(dpy) > 0:
+		x11.XNextEvent(dpy, ctypes.byref(event))
+		kind = event.type
+
+		if kind == ConfigureNotify:
+			c = event.configure
+			consider(c.window, c.x, c.y, c.height)
+		elif kind == MapNotify:
+			w = event.map.window
+			a = attrs(w)
+			if a:
+				consider(w, a.x, a.y, a.height)
+		elif kind == DestroyNotify:
+			w = event.destroy.window
+			_known.pop(w, None)
+			_home.pop(w, None)
+
+	try:
+		select.select([fd], [], [], SWEEP)
+	except (OSError, select.error):
 		continue
 
-	# Nothing to do until IBus brings it back.
-	if a.x <= -1000:
-		small_seen = 0
-		time.sleep(POLL)
-		continue
-
-	if a.height < HEIGHT_MAX:
-		small_seen += 1
-		if small_seen >= CONFIRMATIONS:
-			x11.XMoveWindow(dpy, win, *OFFSCREEN)
-			x11.XFlush(dpy)
-			log(f"parked leftover {a.width}x{a.height} window 0x{win:08x} offscreen")
-			small_seen = 0
-	else:
-		small_seen = 0
-
-	time.sleep(POLL)
+	if x11.XPending(dpy) == 0:
+		sweep()
