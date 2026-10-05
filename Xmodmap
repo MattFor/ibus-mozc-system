@@ -5,10 +5,11 @@
 ! Right Ctrl -> hiragana <-> katakana. Grabbed by XFCE, runs kana-toggle.
 keycode 105 = Katakana
 
-! Insert -> force hiragana. Grabbed by XFCE, runs kana-reset.
+! Insert -> full-width <-> half-width katakana. Grabbed by XFCE, runs kana-width.
 keycode 118 = Hiragana
 
-! Menu -> English <-> Japanese. Handled inside Mozc, not grabbed.
+! Menu -> English <-> Japanese. Handled inside Mozc, not grabbed. Its auto-repeat
+! must be off too, or a held Menu toggles twenty times a second: kana-switch norepeat.
 keycode 135 = Zenkaku_Hankaku
 
 ! Right Ctrl must stop being a Control key: re-mapping the keysym does not
@@ -31,5 +32,5 @@ keycode 103 = Eisu_toggle
 ! park them on keycodes 102 and 101, where no pc105 key produces them and XFCE
 ! does not grab them. If a layout lacks them, kana-switch borrows a keycode.
 !
-! Applying this file re-enables X auto-repeat on the shortcut keycodes, which
-! xmodmap cannot express. Follow it with `kana-switch norepeat`.
+! Applying this file re-enables X auto-repeat on the shortcut keycodes and Menu,
+! which xmodmap cannot express. Follow it with `kana-switch norepeat`.

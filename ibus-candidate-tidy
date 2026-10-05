@@ -4,10 +4,23 @@ import ctypes
 import os
 import select
 import sys
+import time
 
-HEIGHT_MAX = int(os.environ.get("IBUS_TIDY_HEIGHT_MAX", "60"))
 
-SWEEP = float(os.environ.get("IBUS_TIDY_SWEEP", os.environ.get("IBUS_TIDY_POLL", "2.0")))
+def env_number(names, default):
+	for name in names:
+		try:
+			return float(os.environ[name])
+		except (KeyError, ValueError):
+			continue
+	return default
+
+
+HEIGHT_MAX = int(env_number(["IBUS_TIDY_HEIGHT_MAX"], 60))
+
+SWEEP = max(0.1, env_number(["IBUS_TIDY_SWEEP", "IBUS_TIDY_POLL"], 2.0))
+
+DISABLED = os.path.expanduser("~/.config/ibus-candidate-tidy.disabled")
 
 OFFSCREEN = (-10000, -10000)
 PARKED_X = -1000  # Anything left of this is from this program or already hidden
@@ -188,7 +201,9 @@ def is_candidate(win):
 	hit = _known.get(win)
 	if hit is None:
 		a = attrs(win)
-		hit = bool(a and a.override_redirect and is_ibus_panel(win))
+		if not a:
+			return False  # gone, or not readable yet; decide on its next event rather than never
+		hit = bool(a.override_redirect and is_ibus_panel(win))
 		_known[win] = hit
 
 	return hit
@@ -246,6 +261,7 @@ log(f"started (height_max={HEIGHT_MAX} sweep={SWEEP}s, event-driven)")
 
 fd = x11.XConnectionNumber(dpy)
 event = XEvent()
+checked = time.monotonic()
 
 while True:
 	# Drain everything queued before going back to sleep
@@ -270,6 +286,13 @@ while True:
 		select.select([fd], [], [], SWEEP)
 	except (OSError, select.error):
 		continue
+
+	# Checked on the clock, not only when idle: a busy desktop may never go quiet for a whole sweep.
+	if time.monotonic() - checked >= SWEEP:
+		checked = time.monotonic()
+		if os.path.exists(DISABLED):
+			log(f"{DISABLED} exists; stopping")
+			sys.exit(0)
 
 	if x11.XPending(dpy) == 0:
 		sweep()

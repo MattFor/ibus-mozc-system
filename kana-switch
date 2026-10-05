@@ -4,27 +4,59 @@ import contextlib
 import ctypes
 import fcntl
 import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
 import sys
 import time
+from xml.etree import ElementTree
 
 MODES = ("hiragana", "katakana", "half-katakana")
+REPORTED = ("direct", *MODES, "latin", "wide-latin")
+PROPERTY = {
+	"direct": "Direct",
+	"hiragana": "Hiragana",
+	"katakana": "Katakana",
+	"half-katakana": "HalfWidthKatakana",
+	"latin": "Latin",
+	"wide-latin": "WideLatin",
+}
+MODE_OF_PROPERTY = {prop: mode for mode, prop in PROPERTY.items()}
 CARRIER = {"hiragana": "Muhenkan", "katakana": "Hiragana_Katakana", "half-katakana": "Eisu_toggle"}
 WIDTH_OF = {"katakana": "full", "half-katakana": "half"}
 KATAKANA_AT = {"full": "katakana", "half": "half-katakana"}
 
 TRIGGER_KEYSYMS = ("Katakana", "Hiragana")
+IME_TOGGLE_KEYSYMS = ("Zenkaku_Hankaku",)  # Menu; switched inside Mozc, never grabbed
 
 SESSION_PROCS = ("ibus-daemon", "ibus-engine-moz", "mozc_server")
 
-STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "mozc-kana-state")
-LOCK = STATE + ".lock"
+MOZC_BUS_NAME = "com.google.IBus.Mozc"
+ENGINE_ROOT = "/org/freedesktop/IBus/Engine"
+ENGINE_SIGNALS = (
+	"type='signal',interface='org.freedesktop.IBus.Engine',member='UpdateProperty'",
+	"type='signal',interface='org.freedesktop.IBus.Engine',member='RegisterProperties'",
+)
+
+
+def env_number(name, default):
+	try:
+		return max(0, int(os.environ.get(name, default)))
+	except ValueError:
+		return default
+
+
+WAIT_MS = env_number("KANA_WAIT_MS", 800)
+HOLD_MS = env_number("KANA_HOLD_MS", 5000)
+SETTLE_MS = env_number("KANA_SETTLE_MS", 60)
+MAP_SETTLE_MS = env_number("KANA_MAP_SETTLE_MS", 30)
+CONFIRM_MS = env_number("KANA_CONFIRM_MS", 300)
+RESTORE_SECS = 60
 
 START = time.monotonic()
-
-WAIT_MS = int(os.environ.get("KANA_WAIT_MS", "800"))
-HOLD_MS = int(os.environ.get("KANA_HOLD_MS", "5000"))
-SETTLE_MS = int(os.environ.get("KANA_SETTLE_MS", "60"))
-MAP_SETTLE_MS = int(os.environ.get("KANA_MAP_SETTLE_MS", "30"))
 
 VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
 
@@ -34,9 +66,37 @@ def log(msg):
 		print(f"kana-switch: {msg}", file=sys.stderr, flush=True)
 
 
+def note(msg):
+	"""Always printed; the follower's stderr is ibus-mozc-init's log."""
+	print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} kana-switch: {msg}", file=sys.stderr, flush=True)
+
+
 def die(msg, code=2):
 	print(f"kana-switch: {msg}", file=sys.stderr, flush=True)
 	sys.exit(code)
+
+
+def runtime_dir():
+	"""XDG_RUNTIME_DIR, or a private per-user directory under /tmp."""
+	path = os.environ.get("XDG_RUNTIME_DIR")
+	if path and os.path.isdir(path):
+		return path
+
+	# A shared /tmp name can be pre-created by another user; this one is checked.
+	path = f"/tmp/kana-switch-{os.getuid()}"
+	with contextlib.suppress(FileExistsError):
+		os.mkdir(path, 0o700)
+	st = os.lstat(path)
+	if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+		die(f"{path} is not a private directory of this user; set XDG_RUNTIME_DIR")
+
+	return path
+
+
+RUNTIME = runtime_dir()
+STATE = os.path.join(RUNTIME, "mozc-kana-state")
+LOCK = STATE + ".lock"
+FOLLOW_LOCK = STATE + ".follow.lock"
 
 
 Display = ctypes.c_void_p
@@ -109,12 +169,12 @@ except OSError:
 	xtst = None
 
 
-def open_display():
+def open_display(required=True):
 	dpy = x11.XOpenDisplay(None)
-	if not dpy:
+	if not dpy and required:
 		die(f"cannot open display (DISPLAY={os.environ.get('DISPLAY')})")
 
-	return dpy
+	return dpy or None
 
 
 def keyboard_mapping(dpy):
@@ -213,6 +273,19 @@ def fake_key(dpy, keycode, press):
 	return True
 
 
+def wait_for_release(dpy, triggers):
+	"""When the shortcut key came up, or when we stopped waiting for it."""
+	start = time.monotonic()
+	deadline = start + HOLD_MS / 1000.0
+	while held_keycodes(dpy) & triggers:
+		if time.monotonic() >= deadline:
+			log(f"shortcut key held over {HOLD_MS}ms; not waiting for it any longer")
+			break
+		time.sleep(0.01)
+
+	return time.monotonic()
+
+
 def wait_until_quiet(dpy, triggers, modifiers):
 	"""Wait for the shortcut key and modifiers to come up."""
 	start = time.monotonic()
@@ -270,31 +343,104 @@ def send_keysym(dpy, name, table, per_code, trigger_kcs, stuck_mods):
 
 	# Shift Muhenkan is a different Mozc binding, so held modifiers must go.
 	to_clear = sorted(stuck_mods - trigger_kcs)
-	for kc in to_clear:
-		fake_key(dpy, kc, False)
+	try:
+		for kc in to_clear:
+			fake_key(dpy, kc, False)
 
-	if not fake_key(dpy, keycode, True):
-		import subprocess
+		if fake_key(dpy, keycode, True):
+			fake_key(dpy, keycode, False)
+		else:
+			x11.XSync(dpy, False)
+			try:
+				subprocess.run(["xdotool", "key", name], check=False, timeout=5)
+			except (OSError, subprocess.SubprocessError) as e:
+				log(f"xdotool fallback failed: {e}")
+
+		for kc in to_clear:
+			fake_key(dpy, kc, True)
 
 		x11.XSync(dpy, False)
-		subprocess.run(["xdotool", "key", name], check=False)
-	else:
-		fake_key(dpy, keycode, False)
+	finally:
+		# A borrowed keycode left in place would type the carrier for the rest of the session.
+		if borrowed is not None:
+			time.sleep(MAP_SETTLE_MS / 1000.0)
+			syms = (KeySym * per_code)()
+			x11.XChangeKeyboardMapping(dpy, borrowed, per_code, syms, 1)
+			x11.XSync(dpy, False)
 
-	for kc in to_clear:
-		fake_key(dpy, kc, True)
 
-	x11.XSync(dpy, False)
+def run(argv, timeout=3.0):
+	"""stdout of a command that succeeded, else None."""
+	try:
+		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+	except (OSError, subprocess.SubprocessError):
+		return None
 
-	if borrowed is not None:
-		time.sleep(MAP_SETTLE_MS / 1000.0)
-		syms = (KeySym * per_code)()
-		x11.XChangeKeyboardMapping(dpy, borrowed, per_code, syms, 1)
-		x11.XSync(dpy, False)
+	return out.stdout if out.returncode == 0 else None
+
+
+def ibus_address():
+	addr = (run(["ibus", "address"]) or "").strip()
+	return addr if addr.startswith("unix:") else None
+
+
+def mozc_engines(addr):
+	"""Object paths of the live Mozc engines on this bus."""
+	xml = run(
+		["gdbus", "introspect", "--address", addr, "--dest", MOZC_BUS_NAME, "--object-path", ENGINE_ROOT, "--xml"]
+	)
+	try:
+		nodes = ElementTree.fromstring(xml).findall("node") if xml else []
+	except ElementTree.ParseError:
+		return []
+
+	return [f"{ENGINE_ROOT}/{n.get('name')}" for n in nodes if n.get("name")]
+
+
+def activate(mode):
+	if not shutil.which("gdbus"):
+		log("gdbus not found")
+		return False
+
+	addr = ibus_address()
+	if not addr:
+		log("no IBus bus address")
+		return False
+
+	engines = mozc_engines(addr)
+	if not engines:
+		log(f"no {MOZC_BUS_NAME} engine on {addr}")
+		return False
+
+	accepted = False
+	for path in engines:
+		reply = run(
+			[
+				"gdbus",
+				"call",
+				"--timeout",
+				"2",
+				"--address",
+				addr,
+				"--dest",
+				MOZC_BUS_NAME,
+				"--object-path",
+				path,
+				"--method",
+				"org.freedesktop.IBus.Engine.PropertyActivate",
+				f"InputMode.{PROPERTY[mode]}",
+				"1",
+			]
+		)
+		log(f"PropertyActivate InputMode.{PROPERTY[mode]} on {path}: {'ok' if reply is not None else 'failed'}")
+		accepted = accepted or reply is not None
+
+	return accepted
 
 
 def fingerprint():
-	"""PID and start time of the processes holding the Mozc session."""
+	"""PID and start time of this user's processes holding the Mozc session."""
+	uid = os.getuid()
 	found = []
 	try:
 		pids = [p for p in os.listdir("/proc") if p.isdigit()]
@@ -307,6 +453,10 @@ def fingerprint():
 				comm = fh.read().strip()
 
 			if not any(comm.startswith(p) for p in SESSION_PROCS):
+				continue
+
+			# Another user's IBus (a greeter, a second login) is not this session.
+			if os.stat(f"/proc/{pid}").st_uid != uid:
 				continue
 
 			with open(f"/proc/{pid}/stat") as fh:
@@ -322,61 +472,95 @@ def fingerprint():
 
 
 def read_state():
-	"""(mode, width, reason)"""
+	state = {"mode": None, "kana": "hiragana", "width": "full", "source": "", "session": ""}
 	try:
 		with open(STATE) as fh:
 			lines = fh.read().split("\n")
 	except OSError:
-		return None, "full", "no state file"
+		return state, "no state file"
 
-	mode = lines[0].strip() if lines else ""
-	stored_fp = ""
-	width = "full"
+	mode = lines[0].strip()
+	fields = {}
 	for line in lines[1:]:
-		if line.startswith("session="):
-			stored_fp = line[len("session=") :].strip()
-		elif line.startswith("width="):
-			width = line[len("width=") :].strip()
+		key, sep, value = line.partition("=")
+		if sep:
+			fields[key.strip()] = value.strip()
 
-	if width not in KATAKANA_AT:
-		width = "full"
+	if fields.get("width") in KATAKANA_AT:
+		state["width"] = fields["width"]
+	state["source"] = fields.get("source", "requested")
+	state["session"] = fields.get("session", "")
 
-	if mode not in MODES:
-		return None, width, f"unusable state {mode!r}"
-	if not stored_fp:
-		return None, width, "state predates session tracking"
-	if stored_fp != fingerprint():
-		return None, width, "Mozc session was restarted since the state was written"
+	if mode not in REPORTED:
+		return state, f"unusable state {mode!r}"
+	if not state["session"]:
+		return state, "state predates session tracking"
+	if state["session"] != fingerprint():
+		return state, "Mozc session was restarted since the state was written"
 
-	return mode, width, "state is current"
+	state["mode"] = mode
+	kana = fields.get("kana", mode)  # a file from before kana= existed names a kana mode first
+	state["kana"] = kana if kana in MODES else "hiragana"
+
+	return state, "state is current"
 
 
-def write_state(mode, width):
+def write_state(mode, kana, width, source):
 	tmp = f"{STATE}.{os.getpid()}"
 	try:
-		with open(tmp, "w") as fh:
-			fh.write(f"{mode}\nwidth={width}\nsession={fingerprint()}\n")
+		fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+		with os.fdopen(fd, "w") as fh:
+			fh.write(f"{mode}\nkana={kana}\nwidth={width}\nsource={source}\nsession={fingerprint()}\n")
 
 		os.replace(tmp, STATE)
 	except OSError as e:
-		log(f"could not record state: {e}")
-		try:
+		note(f"could not record state: {e}")
+		with contextlib.suppress(OSError):
 			os.unlink(tmp)
+
+
+def after(kana, width, mode):
+	"""(kana, width) once Mozc is in `mode`."""
+	return (mode if mode in MODES else kana), WIDTH_OF.get(mode, width)
+
+
+def follower_alive():
+	try:
+		fd = os.open(FOLLOW_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+	except OSError:
+		return False
+
+	# Shared, so that two of these checks at once never mistake each other for the follower's exclusive hold.
+	try:
+		fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+	except BlockingIOError:
+		return True
+	finally:
+		os.close(fd)  # also drops the lock if it was free and we took it
+
+	return False
+
+
+def wait_observed(mode, budget_ms):
+	"""Whether the follower saw Mozc arrive in `mode` within the budget."""
+	deadline = time.monotonic() + budget_ms / 1000.0
+	while True:
+		# Only the follower writes while it runs, so the fingerprint need not be re-derived on every poll.
+		try:
+			with open(STATE) as fh:
+				lines = fh.read().split("\n")
 		except OSError:
-			pass
-
-
-def current_mode():
-	mode, width, why = read_state()
-	if mode is None:
-		return "hiragana", "full", why, False  # Mozc's cold-start mode
-
-	return mode, width, why, True
+			lines = [""]
+		if lines[0].strip() == mode and "source=observed" in lines[1:]:
+			return True
+		if time.monotonic() >= deadline:
+			return False
+		time.sleep(0.01)
 
 
 @contextlib.contextmanager
 def press_lock():
-	fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+	fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 	try:
 		fcntl.flock(fd, fcntl.LOCK_EX)
 		yield fd
@@ -402,6 +586,16 @@ def write_handled_until(fd, when):
 	os.write(fd, f"{when:.6f}\n".encode())
 
 
+def target_for(want, kana, width):
+	if want == "toggle":
+		return "hiragana" if kana != "hiragana" else KATAKANA_AT[width]
+	if want == "width":
+		# Hiragana has no half-width form, so from there this means "the narrow kana" rather than a no-op.
+		return "katakana" if kana == "half-katakana" else "half-katakana"
+
+	return want
+
+
 def apply(want):
 	"""Put Mozc into a mode. `want` is a mode name, "toggle" or "width"."""
 	with press_lock() as lock:
@@ -410,44 +604,219 @@ def apply(want):
 			log("coalesced: the key was still down when this copy was spawned")
 			return
 
-		mode, width, why, _ = current_mode()
-		if want == "toggle":
-			target = "hiragana" if mode != "hiragana" else KATAKANA_AT[width]
-		elif want == "width":
-			# Hiragana has no half-width form, so from there this means "the narrow kana" rather than a no-op.
-			target = "katakana" if mode == "half-katakana" else "half-katakana"
+		state, why = read_state()
+		# Toggling works on the kana Mozc is in, or returns to from direct input.
+		kana, width = state["kana"], state["width"]
+		target = target_for(want, kana, width)
+		log(f"current {state['mode'] or 'unknown'}, kana {kana} ({why}) -> {target}")
+
+		if activate(target):
+			how = "ibus"
+			# Nothing was injected, so there is no grab to wait out; the release is only waited
+			# for so that auto-repeat copies of this same press can be recognised and dropped.
+			dpy = open_display(required=False)
+			if dpy:
+				try:
+					table, _lo, _hi, _per = keyboard_mapping(dpy)
+					released_at = wait_for_release(dpy, keycodes_for(table, TRIGGER_KEYSYMS))
+				finally:
+					x11.XCloseDisplay(dpy)
+			else:
+				released_at = time.monotonic()
 		else:
-			target = want
-		if want in ("toggle", "width"):
-			log(f"current {mode} ({why}) -> {target}")
+			how = "keys"
+			dpy = open_display()
+			try:
+				table, _lo, _hi, per = keyboard_mapping(dpy)
+				triggers = keycodes_for(table, TRIGGER_KEYSYMS)
+				log(f"trigger keycodes {sorted(triggers)}")
 
-		width = WIDTH_OF.get(target, width)
+				stuck = wait_until_quiet(dpy, triggers, modifier_keycodes(dpy))
+				released_at = time.monotonic()
+				if SETTLE_MS:
+					time.sleep(SETTLE_MS / 1000.0)
 
-		dpy = open_display()
-		try:
-			table, _lo, _hi, per = keyboard_mapping(dpy)
-			triggers = keycodes_for(table, TRIGGER_KEYSYMS)
-			log(f"trigger keycodes {sorted(triggers)}")
+				send_keysym(dpy, CARRIER[target], table, per, triggers, stuck)
+				log(f"sent {CARRIER[target]} for {target}")
+			finally:
+				x11.XCloseDisplay(dpy)
 
-			stuck = wait_until_quiet(dpy, triggers, modifier_keycodes(dpy))
-			released_at = time.monotonic()
-			if SETTLE_MS:
-				time.sleep(SETTLE_MS / 1000.0)
+		if follower_alive():
+			# The follower records what Mozc reports, which is the truth even when Mozc
+			# declined, e.g. in a password field. Wait for it so the next press reads it.
+			if wait_observed(target, CONFIRM_MS):
+				log(f"Mozc confirmed {target} (via {how})")
+			else:
+				log(f"Mozc did not report {target} within {CONFIRM_MS}ms (via {how}); state left as observed")
+		else:
+			kana, width = after(kana, width, target)
+			write_state(target, kana, width, "requested")
 
-			send_keysym(dpy, CARRIER[target], table, per, triggers, stuck)
-			log(f"sent {CARRIER[target]} for {target}")
-		finally:
-			x11.XCloseDisplay(dpy)
-
-		write_state(target, width)
 		write_handled_until(lock, released_at)
 
 
+class Follower:
+	HEADER = re.compile(r"^(signal|method call|method return|error) ")
+	KEY = re.compile(r'^(\s*)string "InputMode\.(\w+)"$')
+	UINT = re.compile(r"^(\s*)uint32 (\d+)$")
+
+	def __init__(self, dpy):
+		self.dpy = dpy
+		state, _ = read_state()
+		self.mode = None  # only what has been observed by this process
+		self.kana = state["kana"] if state["mode"] else "hiragana"
+		self.width = state["width"]
+		self.engine = None  # (bus address, sender) last heard from
+		self.restore = None  # (mode, deadline) after the engine was rebuilt
+		self.tried = 0.0
+
+		self.sender = None
+		self.pending = None  # (indent, property, uint32 lines seen) inside one property
+
+	def run(self):
+		while True:
+			addr = ibus_address()
+			if addr:
+				self.watch(addr)
+			x11.XSync(self.dpy, False)  # Xlib ends this process once the X server is gone
+			time.sleep(2)
+
+	def watch(self, addr):
+		proc = subprocess.Popen(
+			["dbus-monitor", "--address", addr, *ENGINE_SIGNALS],
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			preexec_fn=die_with_parent,
+		)
+		log(f"following {addr}")
+		buf = b""
+		try:
+			while True:
+				ready, _, _ = select.select([proc.stdout], [], [], 5.0)
+				if ready:
+					chunk = os.read(proc.stdout.fileno(), 65536)
+					if not chunk:
+						break  # the bus went away
+					buf += chunk
+					*lines, buf = buf.split(b"\n")
+					for line in lines:
+						self.feed(addr, line.decode("utf-8", "replace"))
+				else:
+					x11.XSync(self.dpy, False)
+				self.retry_restore()
+		finally:
+			proc.terminate()
+			with contextlib.suppress(subprocess.TimeoutExpired):
+				proc.wait(timeout=2)
+
+	def feed(self, addr, line):
+		if self.HEADER.match(line):
+			hit = re.search(r"\bsender=(\S+)", line)
+			self.sender = hit.group(1) if hit else None
+			self.pending = None
+			return
+
+		hit = self.KEY.match(line)
+		if hit:
+			self.pending = (len(hit.group(1)), hit.group(2), 0)
+			return
+
+		if self.pending is None:
+			return
+
+		# A property serialises as key, type, label, icon, tooltip, sensitive, visible,
+		# state, ...; the state is the second uint32 at the key's own depth.
+		hit = self.UINT.match(line)
+		indent, prop, seen = self.pending
+		if hit and len(hit.group(1)) == indent:
+			seen += 1
+			if seen < 2:
+				self.pending = (indent, prop, seen)
+				return
+			self.pending = None
+			if hit.group(2) == "1" and prop in MODE_OF_PROPERTY:
+				self.observed((addr, self.sender), MODE_OF_PROPERTY[prop])
+
+	def observed(self, engine, mode):
+		rebuilt = self.engine is not None and engine != self.engine
+		if rebuilt:
+			note(f"Mozc engine was rebuilt ({self.engine[1]} -> {engine[1]}); it reports {mode}")
+			self.kana = "hiragana"  # a new engine's cold start
+			if self.mode in MODES and mode == "direct":
+				self.restore = (self.mode, time.monotonic() + RESTORE_SECS)
+				self.tried = 0.0
+		elif self.restore and mode != "direct":
+			if mode == self.restore[0]:
+				note(f"global state restored: {mode}")
+			self.restore = None
+
+		changed = rebuilt or mode != self.mode
+		self.engine, self.mode = engine, mode
+		self.kana, self.width = after(self.kana, self.width, mode)
+		if changed:
+			log(f"Mozc reports {mode}")
+			write_state(mode, self.kana, self.width, "observed")
+
+		self.retry_restore()
+
+	def retry_restore(self):
+		if not self.restore:
+			return
+		mode, deadline = self.restore
+		now = time.monotonic()
+		if now >= deadline:
+			note(f"gave up restoring {mode}; Mozc stayed in direct input")
+			self.restore = None
+		elif now - self.tried >= 2.0:
+			self.tried = now
+			activate(mode)
+
+
+def die_with_parent():
+	"""In the child: take SIGTERM when the follower dies, however it dies."""
+	with contextlib.suppress(OSError, AttributeError):
+		ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def cmd_follow():
+	fd = os.open(FOLLOW_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except BlockingIOError:
+		log("another follower is already running")
+		return 0
+
+	if not shutil.which("dbus-monitor"):
+		die("dbus-monitor is not on PATH; it is required to follow Mozc", 1)
+
+	# SIGTERM unwinds through the finally blocks, which stop dbus-monitor.
+	signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+	dpy = open_display()
+	note(f"following Mozc's input mode into {STATE}")
+	Follower(dpy).run()
+	return 0
+
+
+def describe(mode):
+	if mode is None:
+		return "unknown"
+	if mode == "direct":
+		return "English (Mozc direct input)"
+	if mode in MODES:
+		return f"Japanese, {mode}"
+	return f"Japanese, {mode} (Mozc's alphanumeric mode)"
+
+
 def cmd_status():
-	mode, width, why, trusted = current_mode()
-	print(f"mode      : {mode}")
-	print(f"katakana  : {width}-width")
-	print(f"confidence: {'tracked' if trusted else 'assumed'} ({why})")
+	state, why = read_state()
+	alive = follower_alive()
+	source = {"observed": "reported by Mozc on the IBus bus", "requested": "what kana-switch last asked for"}
+	print(f"input     : {describe(state['mode'])}")
+	print(f"kana      : {state['kana']}  (Right Ctrl toggles from it; Menu turns Japanese on in it)")
+	print(f"katakana  : {state['width']}-width")
+	print(f"source    : {source.get(state['source'], state['source'] or '-')}")
+	print(f"follower  : {'running' if alive else 'NOT running (ibus-mozc-init starts it: kana-switch follow)'}")
+	print(f"confidence: {'tracked' if state['mode'] else 'assumed'} ({why})")
 	print(f"state file: {STATE}")
 	print(f"session   : {fingerprint()}")
 	return 0
@@ -460,12 +829,14 @@ def cmd_keys():
 		repeats = repeat_enabled(dpy)
 		print(f"keycode range {lo}-{hi}, {per} keysyms per code")
 
-		for label, names in (("trigger", TRIGGER_KEYSYMS), ("carrier", tuple(CARRIER.values()))):
+		groups = (("trigger", TRIGGER_KEYSYMS), ("ime", IME_TOGGLE_KEYSYMS), ("carrier", tuple(CARRIER.values())))
+		for label, names in groups:
 			for name in names:
 				kcs = sorted(keycodes_for(table, [name]))
-				bad = [k for k in kcs if repeats.get(k)] if label == "trigger" else []
-				note = f"  AUTO-REPEAT ON for {bad} -- run: kana-switch norepeat" if bad else ""
-				print(f"{label:8s} {name:20s} keycode(s) {kcs or '(none - would borrow one)'}{note}")
+				bad = [k for k in kcs if repeats.get(k)] if label != "carrier" else []
+				note_ = f"  AUTO-REPEAT ON for {bad} -- run: kana-switch norepeat" if bad else ""
+				missing = "(none)" if label != "carrier" else "(none - would borrow one)"
+				print(f"{label:8s} {name:20s} keycode(s) {kcs or missing}{note_}")
 
 		print(f"modifier keycodes {sorted(modifier_keycodes(dpy))}")
 		print(f"currently held    {sorted(held_keycodes(dpy))}")
@@ -486,21 +857,40 @@ def cmd_norepeat():
 			print("kana-switch: no shortcut keycodes in the layout; is ~/.Xmodmap applied?", file=sys.stderr)
 			return 1
 
-		disable_repeat(dpy, triggers)
-		still_on = [k for k, on in repeat_enabled(dpy).items() if on and k in triggers]
-		print(f"auto-repeat disabled for keycode(s) {sorted(triggers)}; STILL ON for {still_on}" if still_on else "")
+		# Menu too: a held Menu would toggle Japanese on and off twenty times a second.
+		keys = triggers | keycodes_for(table, IME_TOGGLE_KEYSYMS)
+		disable_repeat(dpy, keys)
+		still_on = sorted(k for k, on in repeat_enabled(dpy).items() if on and k in keys)
+		if still_on:
+			print(f"kana-switch: auto-repeat is STILL ON for keycode(s) {still_on}", file=sys.stderr)
+			return 1
 
-		return 1 if still_on else 0
+		log(f"auto-repeat disabled for keycode(s) {sorted(keys)}")
+		return 0
 	finally:
 		x11.XCloseDisplay(dpy)
 
 
-def main(argv):
-	args = [a for a in argv[1:] if not a.startswith("-")]
-	action = args[0] if args else "toggle"
+USAGE = "usage: kana-switch toggle|width|hiragana|katakana|half-katakana|status|follow|keys|norepeat [--verbose]"
 
+
+def main(argv):
+	flags = [a for a in argv[1:] if a.startswith("-")]
+	args = [a for a in argv[1:] if not a.startswith("-")]
+
+	if "-h" in flags or "--help" in flags:
+		print(__doc__.strip())
+		return 0
+
+	unknown = [f for f in flags if f not in ("-v", "--verbose")]
+	if unknown or len(args) != 1:
+		die(f"{'unknown option ' + unknown[0] + '; ' if unknown else ''}{USAGE}")
+
+	action = args[0]
 	if action == "status":
 		return cmd_status()
+	if action == "follow":
+		return cmd_follow()
 	if action == "keys":
 		return cmd_keys()
 	if action == "norepeat":
@@ -509,11 +899,8 @@ def main(argv):
 		apply(action)
 		return 0
 
-	die(
-		f"usage: {os.path.basename(argv[0])} [toggle|width|hiragana|katakana|half-katakana|status|keys|norepeat] [--verbose]"
-	)
-
-	return None
+	die(f"unknown action {action!r}; {USAGE}")
+	return 2
 
 
 if __name__ == "__main__":

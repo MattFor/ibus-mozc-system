@@ -5,15 +5,28 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
 LOG="$STATE_DIR/ibus-mozc-init.log"
 XIM_LOG="$STATE_DIR/ibus-x11.log"
 DAEMON_LOG="$STATE_DIR/ibus-daemon.log"
-LOCK="${XDG_RUNTIME_DIR:-/tmp}/ibus-mozc-init.lock"
-KANA_STATE="${XDG_RUNTIME_DIR:-/tmp}/mozc-kana-state"
 TIDY_OFF="$HOME/.config/ibus-candidate-tidy.disabled"
+UID_="$(id -u)"
+
+# The same directory kana-switch uses; a shared /tmp name could be taken by another user.
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    RUNTIME="$XDG_RUNTIME_DIR"
+else
+    RUNTIME="/tmp/kana-switch-$UID_"
+    mkdir -m 700 "$RUNTIME" 2>/dev/null
+    if [ -L "$RUNTIME" ] || [ ! -O "$RUNTIME" ]; then
+        echo "ibus-mozc-init: $RUNTIME is not a directory of this user; set XDG_RUNTIME_DIR" >&2
+        exit 1
+    fi
+fi
+LOCK="$RUNTIME/ibus-mozc-init.lock"
+FOLLOW_LOCK="$RUNTIME/mozc-kana-state.follow.lock"
 
 BUS_WAIT=60         # Seconds to wait for the ibus daemon to answer at all
 ACTIVATE_WAIT=90    # Seconds to keep trying to select the engine
 CALL_TIMEOUT=5      # Seconds any single ibus call may block
+HEALTH_TIMEOUT=30   # Seconds the deep probe may take; XOpenIM() can block on a hung server
 LOGIN_PHASE=300     # Seconds of fast polling after login
-XMODMAP_PHASE=60    # Seconds of re-applying ~/.Xmodmap after login
 FAST_INTERVAL=5     # Poll period during the login phase
 SLOW_INTERVAL=15    # Poll period for the rest of the session
 DEEP_EVERY=300      # Seconds between full ibus-health probes
@@ -37,11 +50,16 @@ for candidate in \
     }
 done
 
-TIDY_BIN="$(dirname "$0")/ibus-candidate-tidy"
-[ -x "$TIDY_BIN" ] || TIDY_BIN="$(command -v ibus-candidate-tidy 2>/dev/null)"
+# Next to this copy first: the session PATH need not contain ~/.local/bin.
+sibling() {
+    found="$(dirname "$0")/$1"
+    [ -x "$found" ] || found="$(command -v "$1" 2>/dev/null)"
+    printf '%s\n' "$found"
+}
 
-SWITCH_BIN="$(dirname "$0")/kana-switch"
-[ -x "$SWITCH_BIN" ] || SWITCH_BIN="$(command -v kana-switch 2>/dev/null)"
+TIDY_BIN="$(sibling ibus-candidate-tidy)"
+SWITCH_BIN="$(sibling kana-switch)"
+HEALTH_BIN="$(sibling ibus-health)"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -78,6 +96,8 @@ if [ "$WATCH" = 1 ]; then
     fi
 fi
 
+running() { pgrep -u "$UID_" -x "$1" >/dev/null 2>&1; }
+
 engine_now() { timeout "$CALL_TIMEOUT" ibus engine 2>/dev/null; }
 set_engine() { timeout "$CALL_TIMEOUT" ibus engine "$ENGINE" >/dev/null 2>&1; }
 
@@ -97,6 +117,15 @@ apply_xmodmap() {
     return 0
 }
 
+xmodmap_dropped() {
+    [ -f "$HOME/.Xmodmap" ] || return 1
+    xmodmap -pke 2>/dev/null | awk '
+        src == "want" { if ($1 == "keycode" && $3 == "=") want[$2] = $4; next }
+        $1 == "keycode" && ($2 in want) && $4 == want[$2] { ok[$2] = 1 }
+        END { for (k in want) if (!(k in ok)) exit 0; exit 1 }
+    ' src=want "$HOME/.Xmodmap" src=live -
+}
+
 # 9>&- throughout
 start_xim() {
     if [ -z "$XIM_BIN" ]; then
@@ -113,19 +142,32 @@ ensure_tidy() {
     [ -n "$TIDY_BIN" ] && [ -x "$TIDY_BIN" ] || return 0
     [ -f "$TIDY_OFF" ] && return 0
 
-    pgrep -f "^[^ ]*python[^ ]* $TIDY_BIN" >/dev/null 2>&1 && return 0
+    # Its process name is python3; match the script name wherever it was started from.
+    pgrep -u "$UID_" -f '(^|/)python[0-9.]* ([^ ]*/)?ibus-candidate-tidy( |$)' >/dev/null 2>&1 && return 0
     setsid nohup "$TIDY_BIN" >/dev/null 2>&1 </dev/null 9>&- &
 
     log "started ibus-candidate-tidy"
 }
 
+# kana-switch follow mirrors Mozc's real mode into the state file and keeps it across a rebuilt engine.
+ensure_follow() {
+    [ -n "$SWITCH_BIN" ] && [ -x "$SWITCH_BIN" ] || return 0
+    command -v dbus-monitor >/dev/null 2>&1 || return 0
+
+    # A running follower holds this lock exclusively for its whole life; probe it shared, as everything else does.
+    flock -s -n "$FOLLOW_LOCK" true 2>/dev/null || return 0
+    setsid nohup "$SWITCH_BIN" follow >/dev/null 2>>"$LOG" </dev/null 9>&- &
+
+    log "started kana-switch follow"
+}
+
 ensure_xim() {
-    pgrep -x ibus-x11 >/dev/null 2>&1 && return 0
+    running ibus-x11 && return 0
     log "XIM server (ibus-x11) is gone -- restarting it; see $XIM_LOG"
 
     start_xim
 
-    if pgrep -x ibus-x11 >/dev/null 2>&1; then
+    if running ibus-x11; then
         log "XIM server restarted"
     else
         log "WARNING: XIM server failed to restart"
@@ -148,7 +190,7 @@ session_name_owned() {
 }
 
 ensure_session_bus() {
-    pgrep -x ibus-daemon >/dev/null 2>&1 || return 0
+    running ibus-daemon || return 0
     session_name_owned && return 0
 
     if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
@@ -160,18 +202,18 @@ ensure_session_bus() {
 
     session_fixes=$((session_fixes + 1))
     if [ "$session_fixes" -gt "$MAX_SESSION_FIXES" ]; then
-        log "giving up on the session bus name after $MAX_SESSION_FIXES restarts"
+        [ "$session_fixes" -eq $((MAX_SESSION_FIXES + 1)) ] \
+            && log "giving up on the session bus name after $MAX_SESSION_FIXES restarts"
         return 1
     fi
 
     log "ibus-daemon does not own org.freedesktop.IBus on the session bus"
     log "  -- GTK4 applications get no keys at all -- restarting it (fix #$session_fixes)"
 
-    pkill -x ibus-daemon 2>/dev/null
+    pkill -u "$UID_" -x ibus-daemon 2>/dev/null
     sleep 2
     start_daemon
     sleep 3
-    rm -f "$KANA_STATE"
 
     if session_name_owned; then
         log "session bus name claimed; GTK4 input works again"
@@ -186,7 +228,7 @@ log "Start (watch=$WATCH)"
 session_fixes=0
 
 # 1. Daemon must exist.
-if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
+if ! running ibus-daemon; then
     log "no ibus-daemon, starting one"
     start_daemon
     sleep 2
@@ -225,10 +267,9 @@ ensure_xim
 ensure_tidy
 apply_xmodmap
 
-# 4. Mozc starts in DIRECT with hiragana, so drop stale kana state.
-rm -f "$KANA_STATE"
-
 [ "$WATCH" = 1 ] || exit 0
+
+ensure_follow
 
 log "supervising: engine + XIM, ${FAST_INTERVAL}s for the first ${LOGIN_PHASE}s then ${SLOW_INTERVAL}s"
 
@@ -256,30 +297,33 @@ while :; do
     fi
 
     # The daemon must come back first; the checks below cannot work without it.
-    if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
+    if ! running ibus-daemon; then
         daemon_fixes=$((daemon_fixes + 1))
         log "ibus-daemon itself is gone at ${elapsed}s (repair #$daemon_fixes) [$(context)], restarting"
         start_daemon
         sleep 3
-        rm -f "$KANA_STATE"
     fi
 
-    if [ "$(engine_now)" != "$ENGINE" ]; then
+    # One failed call is not a cleared engine; ask twice before repairing.
+    if [ "$(engine_now)" != "$ENGINE" ] && sleep 1 9>&- && [ "$(engine_now)" != "$ENGINE" ]; then
         engine_fixes=$((engine_fixes + 1))
         log "global engine was cleared at ${elapsed}s (repair #$engine_fixes) [$(context)], re-setting $ENGINE"
         set_engine
-        rm -f "$KANA_STATE" # A rebuilt engine comes back in hiragana
     fi
 
-    if ! pgrep -x ibus-x11 >/dev/null 2>&1; then
+    if ! running ibus-x11; then
         xim_fixes=$((xim_fixes + 1))
         log "XIM server died at ${elapsed}s (repair #$xim_fixes) [$(context)]"
         ensure_xim
     fi
 
     ensure_tidy
+    ensure_follow
 
-    [ "$elapsed" -le "$XMODMAP_PHASE" ] && apply_xmodmap
+    if xmodmap_dropped; then
+        [ "$elapsed" -gt "$LOGIN_PHASE" ] && log "~/.Xmodmap was dropped at ${elapsed}s (layout re-asserted?); re-applying"
+        apply_xmodmap
+    fi
 
     # Catches an ibus-x11 that is alive but no longer owns the @server=ibus selection, which pgrep cannot see.
     if [ "$since_deep" -ge "$DEEP_EVERY" ]; then
@@ -287,13 +331,18 @@ while :; do
         trim_log "$LOG" 2000 500
         trim_log "$XIM_LOG" 2000 500
         ensure_session_bus
-        if command -v ibus-health >/dev/null 2>&1 && ! ibus-health --quiet; then
+        # --xim: only the XIM checks decide this, so a fault a restart cannot fix does not restart XIM forever.
+        if [ -n "$HEALTH_BIN" ] && [ -x "$HEALTH_BIN" ] && ! timeout "$HEALTH_TIMEOUT" "$HEALTH_BIN" --quiet --xim 9>&-; then
             log "deep probe failed while the cheap checks passed, restarting XIM server"
-            pkill -x ibus-x11 2>/dev/null
+            pkill -u "$UID_" -x ibus-x11 2>/dev/null
             sleep 1
             start_xim
             xim_fixes=$((xim_fixes + 1))
-            ibus-health --quiet && log "deep probe healthy again" || log "WARNING: still unhealthy after XIM restart"
+            if timeout "$HEALTH_TIMEOUT" "$HEALTH_BIN" --quiet --xim 9>&-; then
+                log "deep probe healthy again"
+            else
+                log "WARNING: still unhealthy after XIM restart"
+            fi
         fi
     fi
 done

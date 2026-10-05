@@ -1,6 +1,4 @@
 status	key	command
-DirectInput	Ctrl *	IMEOn
-DirectInput	Ctrl /	IMEOn
 DirectInput	Eisu	InputModeHalfKatakana
 DirectInput	Hankaku/Zenkaku	IMEOn
 DirectInput	Henkan	Reconvert
@@ -10,7 +8,6 @@ DirectInput	Muhenkan	InputModeHiragana
 DirectInput	ON	IMEOn
 Precomposition	ASCII	InsertCharacter
 Precomposition	Backspace	Revert
-Precomposition	Ctrl -	IMEOff
 Precomposition	Ctrl Backspace	Undo
 Precomposition	Ctrl Shift Space	InsertFullSpace
 Precomposition	Eisu	InputModeHalfKatakana

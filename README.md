@@ -19,7 +19,7 @@ It does not replace IBus or Mozc. It fills the gaps between IBus, Mozc, X11 and 
 
 | File                  | Purpose                                                         |
 | --------------------- | --------------------------------------------------------------- |
-| `kana-switch`         | The kana switch;                                                |
+| `kana-switch`         | The kana switch, and the follower that tracks the global state  |
 | `kana-toggle`         | `kana-switch toggle` - Right Ctrl                               |
 | `kana-width`          | `kana-switch width` - Insert                                    |
 | `ibus-mozc-init`      | Brings the IBus/Mozc stack up and supervises it for the session |
@@ -79,8 +79,9 @@ clear control / add control = Control_L
 xmodmap ~/.Xmodmap && kana-switch norepeat
 ```
 
-`ibus-mozc-init`, the `Japanese keys` autostart entry and `install` all do this automatically. Only needed by hand
-after running `xmodmap`.
+`ibus-mozc-init`, the `Japanese keys` autostart entry and `install` all do this automatically, and the watcher
+re-applies `~/.Xmodmap` whenever it finds it dropped - a keyboard plugged in or woken from suspend re-asserts the XKB
+layout.
 
 ## XFCE shortcuts
 
@@ -93,19 +94,11 @@ Settings -> Keyboard -> Application Shortcuts:
 
 Apply `~/.Xmodmap` before recording them. `./install --shortcuts` writes both with `xfconf-query`.
 
-The scripts inject `Muhenkan`, `Hiragana_Katakana` and `Eisu_toggle` rather than `Katakana` / `Hiragana`, because XFCE
-has grabbed the latter and injecting one would re-invoke the shortcut.
-
 ## Autostart
 
 ```sh
 cp launchers/*.desktop ~/.config/autostart/
 ```
-
-`ibus-mozc-init --watch` runs for the whole session: fast polling and `~/.Xmodmap` re-application during login, then
-15 s polling, plus a full `ibus-health` probe every 5 minutes. `ibus-daemon` supervises almost nothing - `-R` covers
-only the panel and config modules - so the engine and `ibus-x11` die independently and never come back, often hours
-after login.
 
 ## Testing
 
@@ -123,8 +116,10 @@ Menu       -> English <-> Japanese
 | hiragana: Insert, type `ka`                     | ｶ                     |
 | ｶﾀｶﾅ, Right Ctrl, Right Ctrl, type `ka`         | ｶ (width remembrance) |
 | Japanese off: Right Ctrl, type `ka`             | カ                    |
+| Japanese off: `Ctrl+/`, type `ka`               | ka (state unchanged)  |
+| Japanese on, switch window, type `ka`           | Japanese there too    |
 
-Every one is a single press. Holding a key switches once, on release.
+Every one is a single press. A press switches immediately; holding a key still switches exactly once.
 
 ## Application support
 
@@ -300,6 +295,8 @@ touch ~/.config/ibus-candidate-tidy.disabled   # turn it off
 ibus-mozc-init [--watch]          # run once / supervise the session
 ibus-health [--quiet]             # full report / exit code only
 
+ibus-health --xim                 # the XIM checks only (the watcher's deep probe)
+
 ime-probe                         # does the focused window reach IBus?
 ime-probe --window ID             # ...that one instead
 ime-probe --watch [SECS]          # watch while you type, rather than injecting
@@ -314,12 +311,13 @@ ime-launch --unwrap-desktop NAME  # undo that
 ime-launch --wrap-all [--dry-run] # every entry that needs it, flatpaks included
 
 kana-switch toggle|width|hiragana|katakana|half-katakana
-kana-switch status                # tracked mode, width, and how much to trust it
+kana-switch status                # the global input state, and how far to trust it
+kana-switch follow                # the state follower (the watcher runs it)
 kana-switch keys                  # keycodes, modifiers, auto-repeat state
-kana-switch norepeat              # disable auto-repeat on the shortcut keys
+kana-switch norepeat              # disable auto-repeat on the shortcut keys and Menu
 kana-switch --verbose toggle      # narrate one press
 
-mozc-keymap show|diff FILE|apply FILE [--restart]
+mozc-keymap show|diff FILE|apply FILE [--restart]|reload
 ```
 
 ## Files
@@ -332,13 +330,10 @@ mozc-keymap show|diff FILE|apply FILE [--restart]
 ~/.local/state/ibus-mozc-init.log        startup, repair and health events
 ~/.local/state/ibus-x11.log              XIM server output
 ~/.local/state/ibus-daemon.log           fallback daemon start
-${XDG_RUNTIME_DIR:-/tmp}/ibus-mozc-init.lock
-${XDG_RUNTIME_DIR:-/tmp}/mozc-kana-state[.lock]
+$XDG_RUNTIME_DIR/ibus-mozc-init.lock
+$XDG_RUNTIME_DIR/mozc-kana-state[.lock|.follow.lock]
 ~/.config/mozc/config1.db.bak-*          mozc-keymap backups
 ```
-
-`mozc-kana-state` holds the mode and a fingerprint of the Mozc session it was recorded against. Read it with
-`kana-switch status`; the fingerprint only means anything next to the processes running now.
 
 ## Troubleshooting
 
@@ -371,12 +366,13 @@ under modifiers, `~/.Xmodmap` was dropped - `xmodmap ~/.Xmodmap && kana-switch n
 run `kana-switch norepeat`. Then check `mozc-keymap diff mozc/keymap.tsv`. On a slow machine raise the settle time:
 `KANA_SETTLE_MS=120`.
 
-Toggles backwards. `kana-switch status`. `confidence: assumed` means the stored mode was discarded, which is
-correct after Mozc restarts, press again, every press is absolute. Persistently backwards means the Mozc keymap is
-not installed.
+Toggles backwards. `kana-switch status`. `follower: NOT running` means the state only records what was asked for;
+the watcher restarts the follower within 15 s. `confidence: assumed` means the stored mode was discarded, which is
+correct after Mozc restarts; press again, every press is absolute.
 
-Insert does nothing. Check `kana-switch keys` lists a keycode for `Eisu_toggle`; if not, `~/.Xmodmap` is not
-applied. Then `mozc-keymap diff mozc/keymap.tsv`.
+Insert does nothing. `kana-switch --verbose width` narrates the press; `PropertyActivate ... ok` means Mozc was
+asked. If it falls back to keys, check `kana-switch keys` lists a keycode for `Eisu_toggle`; if not, `~/.Xmodmap` is
+not applied. Then `mozc-keymap diff mozc/keymap.tsv`.
 
 Empty candidate box, or one that keeps re-appearing. `pgrep -af 'ibus-candidate[-]tidy'`, then
 `ibus-candidate-tidy --verbose` and watch it. Threshold is 60 px; override with `IBUS_TIDY_HEIGHT_MAX`. If a
@@ -386,18 +382,21 @@ real candidate list gets parked, that threshold is too high for your font size. 
 ## Removing
 
 ```sh
-rm -f ~/.local/bin/{kana-switch,kana-toggle,kana-width,ibus-mozc-init,ibus-health,ibus-candidate-tidy,mozc-keymap}
+rm -f ~/.local/bin/{kana-switch,kana-toggle,kana-width,ibus-mozc-init,ibus-health,ibus-candidate-tidy,mozc-keymap,ime-launch,ime-probe}
 rm -f ~/.config/autostart/ibus-mozc.desktop "$HOME/.config/autostart/Japanese keys.desktop"
 rm -f ~/.Xmodmap
-pkill -x ibus-mozc-init
+pkill -f 'ibus-mozc-init [-]-watch'
 pkill -f 'ibus-candidate[-]tidy'
+pkill -f 'kana-switch [f]ollow'
 ```
 
-Restore Mozc's previous keymap from the newest `~/.config/mozc/config1.db.bak-*`, then `pkill -x mozc_server`. Remove
-the XFCE shortcuts by hand.
+Unwrap routed entries first (`ime-launch --unwrap-desktop NAME` for each file in `~/.local/share/applications` whose
+`Exec` runs `ime-launch`).
+
+Restore Mozc's previous keymap from the newest `~/.config/mozc/config1.db.bak-*`, then `mozc-keymap reload` (or
+`pkill -x mozc_server`). Remove the XFCE shortcuts by hand.
 
 ## License
 
 MIT [LICENSE](LICENSE).
-
 By MattFor

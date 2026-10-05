@@ -104,7 +104,9 @@ resolve() {
         *) resolved="$(command -v "$1" 2>/dev/null || printf '%s' "$1")" ;;
     esac
 
-    while [ -L "$resolved" ]; do
+    hops=0
+    while [ -L "$resolved" ] && [ "$hops" -lt 40 ]; do # a symlink loop must not hang the launch
+        hops=$((hops + 1))
         link="$(readlink "$resolved")"
         case "$link" in
             /*) resolved="$link" ;;
@@ -172,7 +174,10 @@ embeds_chromium() {
     done
 
     flat="$(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr -d ' _-')"
+    # A short name ("vi", "st") is a prefix of too many profile directories to mean anything.
+    [ ${#flat} -ge 4 ] || flat=""
     for candidate in "${XDG_CONFIG_HOME:-$HOME/.config}"/*/; do
+        [ -n "$flat" ] || break
         [ -d "$candidate" ] || continue
 
         if [ -d "$candidate/Local Storage/leveldb" ] || [ -d "$candidate/GPUCache" ] \
@@ -208,6 +213,8 @@ route_for_exec() {
 }
 
 MARKER='# Exec lines routed through ime-launch by ibus-mozc-system.'
+COPY_NOTE='# A wrapped copy of ' # + the system entry; unwrapping deletes the copy
+INPLACE_NOTE='# Wrapped in place; unwrapping strips the prefix.'
 
 desktop_home() { printf '%s/applications\n' "${XDG_DATA_HOME:-$HOME/.local/share}"; }
 
@@ -232,16 +239,42 @@ refresh_desktop_db() {
         || echo "  note: update-desktop-database failed; the MIME cache in that directory was not rebuilt"
 }
 
+# This script's path as the first word of an Exec line, quoted when the path needs it.
+launcher_exec() {
+    launcher="$(command -v ime-launch 2>/dev/null || true)"
+    [ -x "$HOME/.local/bin/ime-launch" ] && launcher="$HOME/.local/bin/ime-launch"
+    if [ -z "$launcher" ]; then
+        case "$0" in
+            /*) launcher="$0" ;;
+            *) launcher="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+        esac
+    fi
+
+    # These need escaping rules of their own inside Exec (% starts a field code); refuse rather than guess.
+    if printf '%s' "$launcher" | grep -q '["`$\\%]'; then
+        echo "ime-launch: $launcher cannot be written into an Exec line; install it under a plainer path" >&2
+        return 1
+    fi
+
+    case "$launcher" in
+        *[!A-Za-z0-9_/.+,:@-]*) printf '"%s"\n' "$launcher" ;;
+        *) printf '%s\n' "$launcher" ;;
+    esac
+}
+
 # 0 wrapped, 2 already wrapped, 1 nothing to wrap.
 wrap_desktop() {
     id="${1%.desktop}"
     dir="$(desktop_home)"
     dest="$dir/$id.desktop"
 
-    if src="$(find_desktop_system "$id")"; then
-        :
-    elif [ -f "$dest" ]; then
-        src="$dest" # the application ships only a user-level entry
+    # The user-level entry is the one the menu runs: the application's own, or an edited copy of a
+    # system entry. Wrap it where it is, keeping those edits; copy a system entry only when there is none.
+    if [ -f "$dest" ]; then
+        src="$dest"
+        note="$INPLACE_NOTE"
+    elif src="$(find_desktop_system "$id")"; then
+        note="$COPY_NOTE$src"
     else
         echo "ime-launch: no $id.desktop under XDG_DATA_DIRS or in $dir" >&2
         return 1
@@ -254,14 +287,8 @@ wrap_desktop() {
         return 0
     fi
 
-    launcher="$(command -v ime-launch 2>/dev/null || true)"
-    [ -x "$HOME/.local/bin/ime-launch" ] && launcher="$HOME/.local/bin/ime-launch"
-    if [ -z "$launcher" ]; then
-        case "$0" in
-            /*) launcher="$0" ;;
-            *) launcher="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
-        esac
-    fi
+    prefix="$(launcher_exec)" || return 1
+    replacement="$(printf '%s' "$prefix" | sed 's/[&|]/\\&/g')"
 
     mkdir -p "$dir"
     if [ -f "$dest" ]; then
@@ -273,7 +300,8 @@ wrap_desktop() {
     {
         printf '%s\n' "$MARKER"
         printf '# Undo with:  ime-launch --unwrap-desktop %s\n' "$id"
-        sed "s|^Exec=|Exec=$launcher |" "$src"
+        printf '%s\n' "$note"
+        sed "s|^Exec=|Exec=$replacement |" "$src"
     } >"$tmp"
     mv "$tmp" "$dest"
     chmod 644 "$dest"
@@ -315,7 +343,8 @@ wrap_flatpaks() {
 
         found=""
         for marker in chrome_crashpad_handler libcef.so libffmpeg.so snapshot_blob.bin resources/app.asar; do
-            [ -n "$(find "$loc/files" -maxdepth 5 -name "$marker" -print -quit 2>/dev/null)" ] \
+            # -path, not -name: -name never matches a pattern containing a slash.
+            [ -n "$(find "$loc/files" -maxdepth 5 -path "*/$marker" -print -quit 2>/dev/null)" ] \
                 && {
                     found=1
                     break
@@ -345,7 +374,8 @@ wrap_flatpaks() {
 
 wrap_all() {
     dir="$(desktop_home)"
-    list="${TMPDIR:-/tmp}/ime-launch-ids.$$"
+    list="$(mktemp "${TMPDIR:-/tmp}/ime-launch-ids.XXXXXX")"
+    trap 'rm -f "$list"' EXIT
     wrapped=0
     already=0
     itself=0
@@ -355,10 +385,11 @@ wrap_all() {
     while IFS= read -r id; do
         [ -n "$id" ] || continue
 
-        if src="$(find_desktop_system "$id")"; then
-            :
-        elif [ -f "$dir/$id.desktop" ]; then
+        # The same precedence the menu uses: a user-level entry shadows the system one.
+        if [ -f "$dir/$id.desktop" ]; then
             src="$dir/$id.desktop"
+        elif src="$(find_desktop_system "$id")"; then
+            :
         else
             continue
         fi
@@ -396,8 +427,6 @@ wrap_all() {
         fi
     done <"$list"
 
-    rm -f "$list"
-
     wrap_flatpaks
 
     printf '%d entr%s %s, %d already routed, %d self-routing\n' \
@@ -423,13 +452,14 @@ unwrap_desktop() {
             exit 1
         }
 
-    if find_desktop_system "$id" >/dev/null; then
+    if grep -qF "$COPY_NOTE" "$dest" \
+        || { ! grep -qF "$INPLACE_NOTE" "$dest" && find_desktop_system "$id" >/dev/null; }; then
         rm -f "$dest"
         echo "removed $dest (the system entry takes over again)"
     else
         tmp="$dir/.$id.desktop.$$"
-        grep -v -e "^$MARKER\$" -e '^# Undo with:  ime-launch ' "$dest" \
-            | sed 's|^Exec=[^ ]*ime-launch ||' >"$tmp"
+        grep -v -F -e "$MARKER" -e '# Undo with:  ime-launch ' -e "$INPLACE_NOTE" "$dest" \
+            | sed -e 's|^Exec="[^"]*ime-launch" |Exec=|' -e 's|^Exec=[^ "]*ime-launch |Exec=|' >"$tmp"
         mv "$tmp" "$dest"
         chmod 644 "$dest"
         echo "unwrapped $dest"

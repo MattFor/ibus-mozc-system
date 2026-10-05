@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import TypedDict
 
@@ -63,6 +64,12 @@ def window_facts(wid):
 	return {"id": wid, "name": name, "pid": int(pid) if pid.isdigit() else None, "class": cls}
 
 
+def maps_path(line):
+	"""The pathname column of a /proc/PID/maps line; it is the sixth and may contain spaces."""
+	parts = line.rstrip("\n").split(None, 5)
+	return parts[5] if len(parts) == 6 else ""
+
+
 def proc_maps_modules(pid):
 	"""Which input-method modules the process actually loaded."""
 	found = []
@@ -70,7 +77,7 @@ def proc_maps_modules(pid):
 	try:
 		with open(f"/proc/{pid}/maps") as fh:
 			for line in fh:
-				path = line.rstrip("\n").rsplit(" ", 1)[-1]
+				path = maps_path(line)
 				base = os.path.basename(path)
 				if base in IM_MODULES and path not in [p for p, _ in found]:
 					found.append((path, base))
@@ -102,7 +109,7 @@ def proc_mapped_lib(pid, needle):
 	try:
 		with open(f"/proc/{pid}/maps") as fh:
 			for line in fh:
-				path = line.rstrip("\n").rsplit(" ", 1)[-1]
+				path = maps_path(line)
 				if needle in os.path.basename(path):
 					return path
 	except OSError:
@@ -216,38 +223,61 @@ def watch_bus(seconds, action=None):
 	if not addr:
 		die("cannot read the IBus bus address; is ibus-daemon running?")
 
-	proc = subprocess.Popen(
-		["dbus-monitor", "--address", addr],
-		stdout=subprocess.PIPE,
-		stderr=subprocess.DEVNULL,
-		text=True,
-	)
+	with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as capture:
+		proc = subprocess.Popen(
+			["dbus-monitor", "--address", addr],
+			stdout=capture,
+			stderr=subprocess.DEVNULL,
+		)
 
-	time.sleep(1.0)  # let dbus-monitor install its match rules
+		time.sleep(1.0)  # let dbus-monitor install its match rules
 
-	try:
-		if action is not None:
-			action()
-		time.sleep(seconds)
-	finally:
-		proc.terminate()
 		try:
-			out, _ = proc.communicate(timeout=5)
-		except subprocess.TimeoutExpired:
-			proc.kill()
-			out, _ = proc.communicate()
+			if action is not None:
+				action()
+			time.sleep(seconds)
+		finally:
+			proc.terminate()
+			try:
+				proc.wait(timeout=5)
+			except subprocess.TimeoutExpired:
+				proc.kill()
+				proc.wait()
+
+		capture.seek(0)
+		out = capture.read()
 
 	counts = {}
 	for member in re.findall(r"member=([A-Za-z]+)", out or ""):
 		counts[member] = counts.get(member, 0) + 1
 
-	return counts
+	return counts, out or ""
+
+
+PROBE_KEYVAL = 0xFF2A  # Zenkaku_Hankaku
+RELEASE_MASK = 1 << 30  # IBUS_RELEASE_MASK
+
+
+def probe_presses_at_engine(out):
+	"""How many probe-key presses the engine received; each one toggled Mozc on or off."""
+	presses = 0
+	for block in re.split(r"\n(?=method call |signal |method return |error )", out):
+		if "path=/org/freedesktop/IBus/Engine/" not in block or "member=ProcessKeyEvent" not in block:
+			continue
+		values = [int(v) for v in re.findall(r"^\s*uint32 (\d+)$", block, re.M)]
+		if len(values) >= 3 and values[0] == PROBE_KEYVAL and not values[2] & RELEASE_MASK:
+			presses += 1
+	return presses
+
+
+def inject_once():
+	run("xdotool", "key", "--clearmodifiers", PROBE_KEY)
 
 
 def inject_probe():
-	run("xdotool", "key", "--clearmodifiers", PROBE_KEY)
+	inject_once()
 	time.sleep(0.5)
-	run("xdotool", "key", "--clearmodifiers", PROBE_KEY)
+	inject_once()
 
 
 def host_process(pid):
@@ -600,6 +630,7 @@ def main(argv):
 
 	need("xdotool")
 	need("dbus-monitor")
+	need("xprop")
 
 	if "--list" in argv:
 		return cmd_list()
@@ -633,19 +664,30 @@ def main(argv):
 			print(f"Watching the IBus bus for {seconds:g}s.")
 			print(f"Put the cursor in a text field in {window['name']!r} and type now...")
 			print()
-			counts = watch_bus(seconds, action=None)
+			counts, _ = watch_bus(seconds, action=None)
 			return report(window, counts, injected=False)
 
 		# Injecting only makes sense into the window that has the keyboard.
 		if wid != previous:
 			run("xdotool", "windowactivate", "--sync", wid)
 			time.sleep(0.5)
+			if focused_window() != wid:
+				die(f"could not give window {wid} the focus; not injecting into whatever has it instead")
 
 		print("Probing. This only means anything with the caret already in a text")
 		print("field -- no toolkit offers keys to an input method otherwise.")
 		print()
 
-		counts = watch_bus(seconds, action=inject_probe)
+		counts, out = watch_bus(seconds, action=inject_probe)
+		if probe_presses_at_engine(out) % 2:
+			# Only one of the two presses got through: Mozc was left toggled. One more evens it out.
+			if focused_window() == wid:
+				inject_once()
+				print("(one probe press was lost, so Mozc was toggled once more to restore its mode)")
+				print()
+			else:
+				print("NOTE: one probe press was lost and focus moved; Mozc may be left toggled -- press Menu once.")
+				print()
 		return report(window, counts, injected=True)
 	finally:
 		if previous and wid != previous:

@@ -2,17 +2,30 @@
 
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
 from typing import NoReturn
 
-CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mozc", "config1.db")
+HOME = os.path.expanduser("~")
+PROFILE = (
+	os.path.join(HOME, ".mozc")
+	if os.path.isdir(os.path.join(HOME, ".mozc"))
+	else os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "mozc")
+)
+CONFIG = os.path.join(PROFILE, "config1.db")
+IPC_INFO = os.path.join(PROFILE, ".session.ipc")
 
 KEYMAP_FIELD = 42  # Config.custom_keymap_table (TSV string)
-SELECT_FIELD = 20  # Config.session_keymap
+SELECT_FIELD = 41  # Config.session_keymap
 SELECT_CUSTOM = 0  # SessionKeymap.CUSTOM
 HEADER = "status\tkey\tcommand"
+
+SET_CONFIG = 7  # commands.Input.CommandType
+INPUT_TYPE, INPUT_CONFIG = 1, 5  # commands.Input fields
+OUTPUT_CONFIG, OUTPUT_ERROR = 9, 11  # commands.Output fields
 
 WIRE_VARINT, WIRE_64, WIRE_BYTES, WIRE_32 = 0, 1, 2, 5
 
@@ -48,6 +61,12 @@ def write_varint(value):
 			return bytes(out)
 
 
+def take(buf, pos, size):
+	if pos + size > len(buf):
+		raise ValueError("truncated field")
+	return buf[pos : pos + size], pos + size
+
+
 def parse(buf):
 	"""[(field_number, wire_type, raw_value_bytes)] in file order."""
 	fields, pos = [], 0
@@ -59,12 +78,12 @@ def parse(buf):
 			_, pos = read_varint(buf, pos)
 			value = buf[start:pos]
 		elif wire == WIRE_64:
-			value, pos = buf[pos : pos + 8], pos + 8
+			value, pos = take(buf, pos, 8)
 		elif wire == WIRE_BYTES:
 			length, pos = read_varint(buf, pos)
-			value, pos = buf[pos : pos + length], pos + length
+			value, pos = take(buf, pos, length)
 		elif wire == WIRE_32:
-			value, pos = buf[pos : pos + 4], pos + 4
+			value, pos = take(buf, pos, 4)
 		else:
 			raise ValueError(f"unsupported wire type {wire} for field {number}")
 
@@ -86,10 +105,14 @@ def serialise(fields):
 	return bytes(out)
 
 
-def load_config():
+def load_config(missing_ok=False):
 	try:
 		with open(CONFIG, "rb") as fh:
 			raw = fh.read()
+	except FileNotFoundError:
+		if missing_ok:
+			return b"", []  # Mozc writes no file until its settings are first saved
+		die(f"{CONFIG} does not exist; Mozc is running on its defaults")
 	except OSError as e:
 		die(f"cannot read {CONFIG}: {e}")
 
@@ -105,6 +128,14 @@ def current_table(fields):
 			return value.decode("utf-8", "replace")
 
 	return None
+
+
+def read_text(path):
+	try:
+		with open(path, encoding="utf-8") as fh:
+			return fh.read()
+	except (OSError, UnicodeDecodeError) as e:
+		die(f"cannot read {path}: {e}")
 
 
 def check(text, source):
@@ -135,6 +166,82 @@ def check(text, source):
 	return rows
 
 
+def server_call(request):
+	"""Send one request to this user's mozc_server; its reply, or None if it cannot be reached."""
+	try:
+		with open(IPC_INFO, "rb") as fh:
+			info = parse(fh.read())
+	except (OSError, ValueError):
+		return None
+
+	key = next((v.decode("ascii", "replace") for n, w, v in info if n == 1 and w == WIRE_BYTES), "")
+	if not key:
+		return None
+
+	# Mozc's path "/tmp/.mozc.<key>.session", its first byte replaced by NUL: an abstract socket.
+	address = b"\0tmp/.mozc." + key.encode() + b".session"
+	try:
+		with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+			sock.settimeout(5)
+			sock.connect(address)
+			_pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+			if uid != os.getuid():
+				return None
+
+			sock.sendall(request)
+			sock.shutdown(socket.SHUT_WR)  # the server reads to EOF before answering
+			reply = b""
+			while chunk := sock.recv(65536):
+				reply += chunk
+	except OSError:
+		return None
+
+	return reply
+
+
+def set_config_live(config_bytes):
+	"""Hand a whole config to the running server, as Mozc's settings dialog does."""
+	request = (
+		write_varint(INPUT_TYPE << 3 | WIRE_VARINT)
+		+ write_varint(SET_CONFIG)
+		+ write_varint(INPUT_CONFIG << 3 | WIRE_BYTES)
+		+ write_varint(len(config_bytes))
+		+ config_bytes
+	)
+	reply = server_call(request)
+	if not reply:
+		return False
+
+	try:
+		fields = parse(reply)
+	except ValueError:
+		return False
+
+	errors = [read_varint(v, 0)[0] for n, w, v in fields if n == OUTPUT_ERROR and w == WIRE_VARINT]
+	# SetConfig echoes the config back; SESSION_SUCCESS is 0.
+	return any(n == OUTPUT_CONFIG for n, _w, _v in fields) and not any(errors)
+
+
+def write_config(out):
+	os.makedirs(PROFILE, mode=0o700, exist_ok=True)
+	tmp = f"{CONFIG}.new-{os.getpid()}"
+	with open(tmp, "wb") as fh:
+		fh.write(out)
+		fh.flush()
+		os.fsync(fh.fileno())
+
+	if os.path.exists(CONFIG):
+		shutil.copystat(CONFIG, tmp)
+	os.replace(tmp, CONFIG)
+
+
+def restart_server():
+	# mozc_server caches the config at startup; the client relaunches it on the next keystroke.
+	subprocess.run(["pkill", "-u", str(os.getuid()), "-x", "mozc_server"], check=False)
+	time.sleep(0.5)
+	print("mozc-keymap: mozc_server stopped; it restarts on the next keystroke")
+
+
 def cmd_show(argv):
 	_raw, fields = load_config()
 	table = current_table(fields)
@@ -151,9 +258,9 @@ def cmd_diff(argv):
 	if not argv:
 		die("usage: mozc-keymap diff FILE")
 
-	_raw, fields = load_config()
+	want = read_text(argv[0]).split("\n")
+	_raw, fields = load_config(missing_ok=True)
 	live = (current_table(fields) or "").split("\n")
-	want = open(argv[0]).read().split("\n")
 	live = [ln for ln in live if ln.strip()]
 	want = [ln for ln in want if ln.strip()]
 	live_set, want_set = set(live), set(want)
@@ -180,17 +287,12 @@ def cmd_apply(argv):
 	if not files:
 		die("usage: mozc-keymap apply FILE [--restart]")
 
-	try:
-		text = open(files[0]).read()
-	except OSError as e:
-		die(f"cannot read {files[0]}: {e}")
+	text = read_text(files[0])
 	check(text, files[0])
 	if not text.endswith("\n"):
 		text += "\n"
 
-	raw, fields = load_config()
-	backup = f"{CONFIG}.bak-{time.strftime('%Y%m%d%H%M%S')}"
-	shutil.copy2(CONFIG, backup)
+	raw, fields = load_config(missing_ok=True)
 
 	rebuilt, saw_keymap, saw_select = [], False, False
 	for number, wire, value in fields:
@@ -215,37 +317,48 @@ def cmd_apply(argv):
 		if current_table(parse(out)) != text:
 			raise ValueError("round-trip mismatch")
 	except ValueError as e:
-		die(f"refusing to write a config that does not round-trip ({e}); {CONFIG} is untouched, backup at {backup}")
+		die(f"refusing to write a config that does not round-trip ({e}); {CONFIG} is untouched")
 
-	tmp = f"{CONFIG}.new-{os.getpid()}"
+	if raw:
+		backup = f"{CONFIG}.bak-{time.strftime('%Y%m%d%H%M%S')}"
+		shutil.copy2(CONFIG, backup)
+		print(f"mozc-keymap: previous config saved as {backup}")
 
-	with open(tmp, "wb") as fh:
-		fh.write(out)
-
-	shutil.copystat(CONFIG, tmp)
-	os.replace(tmp, CONFIG)
+	write_config(out)
 
 	print(f"mozc-keymap: wrote {len(text.encode())} bytes of keymap to {CONFIG}")
-	print(f"mozc-keymap: previous config saved as {backup}")
 	print(f"mozc-keymap: {'unchanged' if out == raw else 'config changed'}")
 
 	if restart:
-		# mozc_server caches the config at startup; the client relaunches it.
-		subprocess.run(["pkill", "-x", "mozc_server"], check=False)
-		time.sleep(0.5)
-		print("mozc-keymap: mozc_server stopped; it restarts on the next keystroke")
+		restart_server()
+	elif set_config_live(out):
+		print("mozc-keymap: mozc_server took the new config; it is in effect now")
 	else:
-		print("mozc-keymap: restart mozc_server for this to take effect (pkill -x mozc_server), or pass --restart")
+		print("mozc-keymap: mozc_server could not be reached; it reads the new config when it next")
+		print("             starts (pkill -x mozc_server, or run this again with --restart)")
 
 	return 0
 
 
-COMMANDS = {"show": cmd_show, "diff": cmd_diff, "apply": cmd_apply}
+def cmd_reload(argv):
+	raw, _fields = load_config()
+	if set_config_live(raw):
+		print(f"mozc-keymap: mozc_server now uses {CONFIG}")
+		return 0
+
+	die("mozc_server could not be reached (is Mozc running in this session?)")
+
+
+COMMANDS = {"show": cmd_show, "diff": cmd_diff, "apply": cmd_apply, "reload": cmd_reload}
 
 
 def main(argv):
+	if "--help" in argv or "-h" in argv:
+		print(__doc__.strip())
+		return 0
+
 	if len(argv) < 2 or argv[1] not in COMMANDS:
-		die("usage: mozc-keymap {show | diff FILE | apply FILE [--restart]}")
+		die("usage: mozc-keymap {show | diff FILE | apply FILE [--restart] | reload}")
 
 	return COMMANDS[argv[1]](argv[2:])
 

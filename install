@@ -63,7 +63,7 @@ backup() {
 }
 
 missing=""
-for tool in ibus xmodmap xset pgrep pkill flock timeout setsid python3; do
+for tool in ibus xmodmap xset pgrep pkill flock timeout setsid python3 gdbus dbus-monitor xdotool xprop; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 [ -n "$missing" ] && say "WARNING: not found on PATH:$missing"
@@ -108,12 +108,15 @@ done
 if [ "$DO_KEYMAP" = 1 ]; then
     say "Importing mozc/keymap.tsv into Mozc"
     if [ "$DRY" = 1 ]; then
-        say "  would run: $BIN/mozc-keymap apply $SRC/mozc/keymap.tsv --restart"
+        say "  would run: $BIN/mozc-keymap apply $SRC/mozc/keymap.tsv"
     else
-        "$BIN/mozc-keymap" apply "$SRC/mozc/keymap.tsv" --restart
+        # A failure here must not abandon the steps below half-installed.
+        if ! "$BIN/mozc-keymap" apply "$SRC/mozc/keymap.tsv"; then
+            say "  FAILED; the keymap is unchanged (see above)"
+        fi
     fi
 else
-    say "Mozc keymap NOT imported. The kana keys need it, look at docs/mozc-keymap.md."
+    say "Mozc keymap NOT imported. The kana keys need it, look at _documentation/mozc-keymap.md."
     say "  ./install --keymap, or import mozc/keymap.tsv from Mozc's properties dialog."
 fi
 
@@ -157,6 +160,39 @@ else
     say "Application entries NOT wrapped. Electron/CEF programs (Steam's client"
     say "  UI, Discord, Heroic, ...) reach IBus only once they are:"
     say "      ime-launch --wrap-all        # or ./install --wrappers"
+fi
+
+UID_="$(id -u)"
+watcher="$(pgrep -u "$UID_" -f '^/bin/sh [^ ]*ibus-mozc-init --watch' | head -1)"
+if [ -n "$watcher" ] && [ -r "/proc/$watcher/environ" ]; then
+    say "Restarting the session watcher (pid $watcher) on the new scripts"
+    if [ "$DRY" = 1 ]; then
+        say "  would restart ibus-mozc-init --watch, ibus-candidate-tidy and kana-switch follow"
+    else
+        # No set -e here: once the old watcher is killed, every step must run so a new one is started.
+        set +e
+        session_env="$(mktemp)"
+        if cp "/proc/$watcher/environ" "$session_env"; then
+            kill "$watcher" 2>/dev/null
+            # Its helpers are detached and would outlive it on the old code; the new watcher restarts them.
+            # pkill exits 1 when nothing matched, e.g. no follower yet on a first upgrade.
+            pkill -u "$UID_" -f '(^|/)python[0-9.]* ([^ ]*/)?ibus-candidate-tidy( |$)' 2>/dev/null
+            pkill -u "$UID_" -f '(^|/)python[0-9.]* ([^ ]*/)?kana-switch follow' 2>/dev/null
+            sleep 1
+            xargs -0 -x sh -c 'env -i "$@" setsid nohup "$0" --watch >/dev/null 2>&1 </dev/null &' \
+                "$BIN/ibus-mozc-init" <"$session_env"
+            sleep 2
+            if pgrep -u "$UID_" -f '^/bin/sh [^ ]*ibus-mozc-init --watch' >/dev/null; then
+                say "  restarted"
+            else
+                say "  FAILED to start it again; log out and back in, or run: ibus-mozc-init --watch &"
+            fi
+        else
+            say "  could not read its environment; left it running on the old scripts"
+        fi
+        rm -f "$session_env"
+        set -e
+    fi
 fi
 
 say ""
