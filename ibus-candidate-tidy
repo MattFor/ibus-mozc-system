@@ -153,7 +153,7 @@ x11.XSetErrorHandler.restype = ctypes.c_void_p
 x11.XSetErrorHandler.argtypes = [ERRH]
 
 # The candidate window is destroyed and recreated freely
-_keep = ERRH(lambda d, e: 0)
+_keep = ERRH(lambda _d, _e: 0)
 x11.XSetErrorHandler(_keep)
 
 dpy = x11.XOpenDisplay(None)
@@ -284,7 +284,7 @@ while True:
 
 	try:
 		select.select([fd], [], [], SWEEP)
-	except (OSError, select.error):
+	except OSError:
 		continue
 
 	# Checked on the clock, not only when idle: a busy desktop may never go quiet for a whole sweep.

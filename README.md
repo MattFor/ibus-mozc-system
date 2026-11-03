@@ -1,5 +1,9 @@
 # ibus-mozc-system
 
+[![CI](https://github.com/MattFor/ibus-mozc-system/actions/workflows/ci.yml/badge.svg)](https://github.com/MattFor/ibus-mozc-system/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MattFor/ibus-mozc-system)](https://github.com/MattFor/ibus-mozc-system/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Scripts and X11/XFCE configuration for Japanese input with IBus and Mozc on a keyboard with no dedicated Japanese keys.
 
 Two keys, two axes. Right Ctrl switches hiragana ↔ katakana; Insert switches full-width ↔ half-width. One press
@@ -40,7 +44,7 @@ can modify.
 
 ```text
 ibus  ibus-daemon  ibus-x11  xdotool  xmodmap  xset  pgrep  pkill
-flock  timeout  setsid  nohup  Python 3  libX11.so.6  libc.so.6
+flock  timeout  setsid  nohup  Python 3.10+  libX11.so.6  libc.so.6
 gdbus                       (session bus check)
 dbus-monitor  ss            (ime-probe)
 libXtst.so.6 (optional; falls back to xdotool)
@@ -398,5 +402,4 @@ Restore Mozc's previous keymap from the newest `~/.config/mozc/config1.db.bak-*`
 
 ## License
 
-MIT [LICENSE](LICENSE).
-By MattFor
+MIT, see [LICENSE](LICENSE). By [MattFor](https://github.com/MattFor).

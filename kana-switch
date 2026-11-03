@@ -42,7 +42,7 @@ ENGINE_SIGNALS = (
 )
 
 
-def env_number(name, default):
+def env_number(name: str, default: int) -> int:
 	try:
 		return max(0, int(os.environ.get(name, default)))
 	except ValueError:
@@ -247,7 +247,7 @@ _xtest_ok = None
 
 
 def have_xtest(dpy):
-	global _xtest_ok
+	global _xtest_ok  # noqa: PLW0603 -- probed once, then cached for the process
 	if _xtest_ok is None:
 		if xtst is None:
 			_xtest_ok = False
@@ -372,7 +372,7 @@ def send_keysym(dpy, name, table, per_code, trigger_kcs, stuck_mods):
 def run(argv, timeout=3.0):
 	"""stdout of a command that succeeded, else None."""
 	try:
-		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
 	except (OSError, subprocess.SubprocessError):
 		return None
 
@@ -599,7 +599,7 @@ def target_for(want, kana, width):
 def apply(want):
 	"""Put Mozc into a mode. `want` is a mode name, "toggle" or "width"."""
 	with press_lock() as lock:
-		if START < read_handled_until(lock):
+		if read_handled_until(lock) > START:
 			# Spawned before the last press was released: same press, repeated.
 			log("coalesced: the key was still down when this copy was spawned")
 			return
@@ -686,8 +686,9 @@ class Follower:
 			["dbus-monitor", "--address", addr, *ENGINE_SIGNALS],
 			stdout=subprocess.PIPE,
 			stderr=subprocess.DEVNULL,
-			preexec_fn=die_with_parent,
+			preexec_fn=die_with_parent,  # noqa: PLW1509 -- this script starts no threads
 		)
+		assert proc.stdout is not None  # stdout=PIPE
 		log(f"following {addr}")
 		buf = b""
 		try:
@@ -740,6 +741,7 @@ class Follower:
 	def observed(self, engine, mode):
 		rebuilt = self.engine is not None and engine != self.engine
 		if rebuilt:
+			assert self.engine is not None
 			note(f"Mozc engine was rebuilt ({self.engine[1]} -> {engine[1]}); it reports {mode}")
 			self.kana = "hiragana"  # a new engine's cold start
 			if self.mode in MODES and mode == "direct":
@@ -879,7 +881,7 @@ def main(argv):
 	args = [a for a in argv[1:] if not a.startswith("-")]
 
 	if "-h" in flags or "--help" in flags:
-		print(__doc__.strip())
+		print((__doc__ or "").strip())
 		return 0
 
 	unknown = [f for f in flags if f not in ("-v", "--verbose")]

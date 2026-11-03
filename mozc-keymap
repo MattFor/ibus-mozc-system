@@ -242,7 +242,7 @@ def restart_server():
 	print("mozc-keymap: mozc_server stopped; it restarts on the next keystroke")
 
 
-def cmd_show(argv):
+def cmd_show(_argv):
 	_raw, fields = load_config()
 	table = current_table(fields)
 
@@ -340,7 +340,7 @@ def cmd_apply(argv):
 	return 0
 
 
-def cmd_reload(argv):
+def cmd_reload(_argv):
 	raw, _fields = load_config()
 	if set_config_live(raw):
 		print(f"mozc-keymap: mozc_server now uses {CONFIG}")
@@ -354,7 +354,7 @@ COMMANDS = {"show": cmd_show, "diff": cmd_diff, "apply": cmd_apply, "reload": cm
 
 def main(argv):
 	if "--help" in argv or "-h" in argv:
-		print(__doc__.strip())
+		print((__doc__ or "").strip())
 		return 0
 
 	if len(argv) < 2 or argv[1] not in COMMANDS:

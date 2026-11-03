@@ -31,7 +31,7 @@ def say(*a):
 def call(argv, timeout=5):
 	"""(returncode, stdout); a missing or hung tool is a failed call, not a crash."""
 	try:
-		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
 	except (OSError, subprocess.SubprocessError) as e:
 		return -1, f"<call failed: {e}>"
 

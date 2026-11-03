@@ -14,6 +14,7 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
 else
     RUNTIME="/tmp/kana-switch-$UID_"
     mkdir -m 700 "$RUNTIME" 2>/dev/null
+    # shellcheck disable=SC3067 # dash and bash both have -O
     if [ -L "$RUNTIME" ] || [ ! -O "$RUNTIME" ]; then
         echo "ibus-mozc-init: $RUNTIME is not a directory of this user; set XDG_RUNTIME_DIR" >&2
         exit 1
@@ -321,6 +322,7 @@ while :; do
     ensure_follow
 
     if xmodmap_dropped; then
+        # shellcheck disable=SC2088 # a literal ~ in the message
         [ "$elapsed" -gt "$LOGIN_PHASE" ] && log "~/.Xmodmap was dropped at ${elapsed}s (layout re-asserted?); re-applying"
         apply_xmodmap
     fi

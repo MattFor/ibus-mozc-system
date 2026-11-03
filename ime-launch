@@ -169,11 +169,11 @@ embeds_chromium() {
 
     name="$(basename "$1")"
     for candidate in "${XDG_CONFIG_HOME:-$HOME/.config}/$name"/app-*/ \
-        "${XDG_CONFIG_HOME:-$HOME/.config}/$(printf '%s' "$name" | tr 'A-Z' 'a-z')"/app-*/; do
+        "${XDG_CONFIG_HOME:-$HOME/.config}/$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"/app-*/; do
         [ -d "$candidate" ] && has_chromium_markers "${candidate%/}" && return 0
     done
 
-    flat="$(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr -d ' _-')"
+    flat="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -d ' _-')"
     # A short name ("vi", "st") is a prefix of too many profile directories to mean anything.
     [ ${#flat} -ge 4 ] || flat=""
     for candidate in "${XDG_CONFIG_HOME:-$HOME/.config}"/*/; do
@@ -182,7 +182,7 @@ embeds_chromium() {
 
         if [ -d "$candidate/Local Storage/leveldb" ] || [ -d "$candidate/GPUCache" ] \
             || [ -d "$candidate/Code Cache" ] || { [ -f "$candidate/Preferences" ] && [ -d "$candidate/Cache" ]; }; then
-            other="$(basename "$candidate" | tr 'A-Z' 'a-z' | tr -d ' _-')"
+            other="$(basename "$candidate" | tr '[:upper:]' '[:lower:]' | tr -d ' _-')"
             [ ${#other} -ge 4 ] || continue
 
             case "$flat" in "$other"*) return 0 ;; esac
@@ -322,6 +322,7 @@ restart_note() {
 desktop_ids() {
     old_ifs="$IFS"
     IFS=:
+    # shellcheck disable=SC2086 # split on IFS=: on purpose
     set -- ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
     IFS="$old_ifs"
 
@@ -339,7 +340,8 @@ wrap_flatpaks() {
 
     for app in $(flatpak list --app --columns=application 2>/dev/null); do
         loc="$(flatpak info --show-location "$app" 2>/dev/null || true)"
-        [ -n "$loc" ] && [ -d "$loc/files" ] || continue
+        [ -n "$loc" ] || continue
+        [ -d "$loc/files" ] || continue
 
         found=""
         for marker in chrome_crashpad_handler libcef.so libffmpeg.so snapshot_blob.bin resources/app.asar; do

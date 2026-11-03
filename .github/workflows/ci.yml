@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Install tooling
+        run: |
+          python -m pip install ruff==0.16.5 basedpyright==1.40.2
+          curl -fsSL -o shfmt https://github.com/mvdan/sh/releases/download/v3.14.0/shfmt_v3.14.0_linux_amd64
+          sudo install shfmt /usr/local/bin/
+
+      - name: Ruff
+        run: |
+          ruff check --output-format=github .
+          ruff format --check .
+
+      - name: Basedpyright
+        run: |
+          mkdir .pycheck
+          for f in ibus-candidate-tidy ibus-health ime-probe kana-switch mozc-keymap; do cp "$f" ".pycheck/$f.py"; done
+          basedpyright --warnings .pycheck
+
+      - name: Shell
+        run: |
+          shellcheck ibus-mozc-init ime-launch install kana-toggle kana-width
+          shfmt -d -i 4 -ci -bn ibus-mozc-init ime-launch install kana-toggle kana-width
+
+      - name: Prettier
+        run: npx --yes prettier@3.9.6 --check .

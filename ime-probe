@@ -33,9 +33,9 @@ def die(msg, code=2):
 
 def run(*argv, timeout=5):
 	try:
-		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+		out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
 		return out.stdout.strip()
-	except Exception:  # noqa: BLE001
+	except Exception:
 		return ""
 
 
@@ -144,11 +144,7 @@ def is_chromium_proc(pid):
 			if os.path.exists(f"{root}{home}/{marker}"):
 				return True
 
-	for lib in ("libcef.so", "libffmpeg.so", "libvk_swiftshader.so"):
-		if proc_mapped_lib(pid, lib):
-			return True
-
-	return False
+	return any(proc_mapped_lib(pid, lib) for lib in ("libcef.so", "libffmpeg.so", "libvk_swiftshader.so"))
 
 
 def proc_mount_ns(pid):
@@ -264,7 +260,7 @@ def probe_presses_at_engine(out):
 	for block in re.split(r"\n(?=method call |signal |method return |error )", out):
 		if "path=/org/freedesktop/IBus/Engine/" not in block or "member=ProcessKeyEvent" not in block:
 			continue
-		values = [int(v) for v in re.findall(r"^\s*uint32 (\d+)$", block, re.M)]
+		values = [int(v) for v in re.findall(r"^\s*uint32 (\d+)$", block, re.MULTILINE)]
 		if len(values) >= 3 and values[0] == PROBE_KEYVAL and not values[2] & RELEASE_MASK:
 			presses += 1
 	return presses
@@ -295,7 +291,7 @@ def report(window, counts, injected):
 	print(f"window   : {window['id']}  {window['name']!r}")
 	print(f"class    : {window['class'] or '(none)'}")
 	print(
-		f"pid      : {pid if pid else '(unknown)'}"
+		f"pid      : {pid or '(unknown)'}"
 		+ ("   (inside the app's own PID namespace -- sandboxed, e.g. flatpak)" if sandboxed else "")
 	)
 	print()
@@ -310,14 +306,14 @@ def report(window, counts, injected):
 	elif pid:
 		env = proc_env(pid, {"GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS", "SDL_IM_MODULE", "GLFW_IM_MODULE"})
 		if env is None:
-			print("env      : (cannot read /proc/%d/environ)" % pid)
+			print(f"env      : (cannot read /proc/{pid}/environ)")
 		else:
 			shown = {k: v for k, v in env.items() if v}
 			print("env      : " + (", ".join(f"{k}={v}" for k, v in sorted(shown.items())) or "(no IM variables set)"))
 
 		mods = proc_maps_modules(pid)
 		if mods is None:
-			print("module   : (cannot read /proc/%d/maps)" % pid)
+			print(f"module   : (cannot read /proc/{pid}/maps)")
 		elif not mods:
 			print("module   : none loaded -- this process has no input-method module at all")
 		else:
@@ -530,7 +526,7 @@ def audit_verdict(facts):
 		env_note = f"GTK_IM_MODULE={wanted}"
 
 	if facts["gap"]:
-		missing, where, _ = facts["gap"]
+		missing, _where, _ = facts["gap"]
 		place = "its container" if facts["contained"] else "this system"
 		return (
 			"FAIL",

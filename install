@@ -179,6 +179,7 @@ if [ -n "$watcher" ] && [ -r "/proc/$watcher/environ" ]; then
             pkill -u "$UID_" -f '(^|/)python[0-9.]* ([^ ]*/)?ibus-candidate-tidy( |$)' 2>/dev/null
             pkill -u "$UID_" -f '(^|/)python[0-9.]* ([^ ]*/)?kana-switch follow' 2>/dev/null
             sleep 1
+            # shellcheck disable=SC2016 # $@ and $0 belong to the inner sh
             xargs -0 -x sh -c 'env -i "$@" setsid nohup "$0" --watch >/dev/null 2>&1 </dev/null &' \
                 "$BIN/ibus-mozc-init" <"$session_env"
             sleep 2
