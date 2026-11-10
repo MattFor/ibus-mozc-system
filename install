@@ -116,7 +116,7 @@ if [ "$DO_KEYMAP" = 1 ]; then
         fi
     fi
 else
-    say "Mozc keymap NOT imported. The kana keys need it, look at _documentation/mozc-keymap.md."
+    say "Mozc keymap NOT imported. The kana keys need it:"
     say "  ./install --keymap, or import mozc/keymap.tsv from Mozc's properties dialog."
 fi
 

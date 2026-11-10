@@ -352,13 +352,16 @@ def cmd_reload(_argv):
 COMMANDS = {"show": cmd_show, "diff": cmd_diff, "apply": cmd_apply, "reload": cmd_reload}
 
 
+USAGE = "usage: mozc-keymap {show | diff FILE | apply FILE [--restart] | reload}"
+
+
 def main(argv):
 	if "--help" in argv or "-h" in argv:
-		print((__doc__ or "").strip())
+		print(USAGE)
 		return 0
 
 	if len(argv) < 2 or argv[1] not in COMMANDS:
-		die("usage: mozc-keymap {show | diff FILE | apply FILE [--restart] | reload}")
+		die(USAGE)
 
 	return COMMANDS[argv[1]](argv[2:])
 

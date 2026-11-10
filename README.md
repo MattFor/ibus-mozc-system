@@ -355,6 +355,11 @@ routing is fine and the question is a Mozc mode or keymap one, so go to `kana-sw
 Note that no toolkit offers keys to an input method while the caret is outside a text box, so probing a window's
 sidebar or channel list reports zero on a perfectly healthy program. This is a false-positive!
 
+Japanese turns itself on after a break. `mozc_server` deletes a session nothing touched for an hour, typing English
+never touches it, and the session `ibus-mozc` then creates starts in hiragana. The follower touches the session every
+ten minutes while English is on (`KANA_KEEPALIVE_S=600`), so `kana-switch status` must say `follower: running`. A
+katakana mode left idle for an hour still falls back to hiragana.
+
 Engine wrong. `ibus engine` should say `mozc-jp`; run `ibus-mozc-init`. If it keeps being cleared, leave
 `ibus-mozc-init --watch` running.
 

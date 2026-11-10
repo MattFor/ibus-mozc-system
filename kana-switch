@@ -54,6 +54,7 @@ HOLD_MS = env_number("KANA_HOLD_MS", 5000)
 SETTLE_MS = env_number("KANA_SETTLE_MS", 60)
 MAP_SETTLE_MS = env_number("KANA_MAP_SETTLE_MS", 30)
 CONFIRM_MS = env_number("KANA_CONFIRM_MS", 300)
+KEEPALIVE_S = env_number("KANA_KEEPALIVE_S", 600)  # mozc_server drops a session idle for 3600
 RESTORE_SECS = 60
 
 START = time.monotonic()
@@ -397,7 +398,8 @@ def mozc_engines(addr):
 	return [f"{ENGINE_ROOT}/{n.get('name')}" for n in nodes if n.get("name")]
 
 
-def activate(mode):
+def engine_call(method, *args):
+	"""Call an org.freedesktop.IBus.Engine method on every live Mozc engine."""
 	if not shutil.which("gdbus"):
 		log("gdbus not found")
 		return False
@@ -427,15 +429,18 @@ def activate(mode):
 				"--object-path",
 				path,
 				"--method",
-				"org.freedesktop.IBus.Engine.PropertyActivate",
-				f"InputMode.{PROPERTY[mode]}",
-				"1",
+				f"org.freedesktop.IBus.Engine.{method}",
+				*args,
 			]
 		)
-		log(f"PropertyActivate InputMode.{PROPERTY[mode]} on {path}: {'ok' if reply is not None else 'failed'}")
+		log(f"{' '.join((method, *args))} on {path}: {'ok' if reply is not None else 'failed'}")
 		accepted = accepted or reply is not None
 
 	return accepted
+
+
+def activate(mode):
+	return engine_call("PropertyActivate", f"InputMode.{PROPERTY[mode]}", "1")
 
 
 def fingerprint():
@@ -669,6 +674,7 @@ class Follower:
 		self.engine = None  # (bus address, sender) last heard from
 		self.restore = None  # (mode, deadline) after the engine was rebuilt
 		self.tried = 0.0
+		self.touched = 0.0
 
 		self.sender = None
 		self.pending = None  # (indent, property, uint32 lines seen) inside one property
@@ -704,6 +710,7 @@ class Follower:
 						self.feed(addr, line.decode("utf-8", "replace"))
 				else:
 					x11.XSync(self.dpy, False)
+				self.keepalive()
 				self.retry_restore()
 		finally:
 			proc.terminate()
@@ -760,6 +767,19 @@ class Follower:
 			write_state(mode, self.kana, self.width, "observed")
 
 		self.retry_restore()
+
+	def keepalive(self):
+		"""Touch Mozc's session while English is on: an expired one comes back with Japanese on."""
+		now = time.monotonic()
+		if not KEEPALIVE_S or self.restore or now - self.touched < KEEPALIVE_S:
+			return
+		self.touched = now
+		# ponytail: English only, so idle katakana still drops to hiragana; a kana mode needs preedit tracking to touch.
+		if (self.mode or read_state()[0]["mode"]) != "direct":
+			return
+		# Reset wakes an expired session in hiragana; Direct turns that back off.
+		engine_call("Reset")
+		activate("direct")
 
 	def retry_restore(self):
 		if not self.restore:
@@ -881,7 +901,7 @@ def main(argv):
 	args = [a for a in argv[1:] if not a.startswith("-")]
 
 	if "-h" in flags or "--help" in flags:
-		print((__doc__ or "").strip())
+		print(USAGE)
 		return 0
 
 	unknown = [f for f in flags if f not in ("-v", "--verbose")]

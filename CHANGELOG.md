@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Japanese no longer turns itself on after the computer was left alone. `mozc_server` drops a session
+  idle for an hour and the one `ibus-mozc` recreates starts in hiragana; `kana-switch follow` now
+  touches the session every ten minutes while English is on (`KANA_KEEPALIVE_S`), and repairs one
+  that already expired.
+- `kana-switch`, `mozc-keymap` and `ime-probe` print their usage for `--help` instead of an empty
+  line.
+- `install` no longer points at a `_documentation` directory the repository does not ship.
+
 ## [1.2.1] - 01:51 CEST 03-11-2026
 
 ### Added
