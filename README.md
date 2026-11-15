@@ -6,6 +6,8 @@
 
 Scripts and X11/XFCE configuration for Japanese input with IBus and Mozc on a keyboard with no dedicated Japanese keys.
 
+## Features
+
 Two keys, two axes. Right Ctrl switches hiragana ↔ katakana; Insert switches full-width ↔ half-width. One press
 each, from any state; mid-word, mid-conversion, or with Japanese input off.
 
@@ -19,7 +21,7 @@ Mozc has no half-width hiragana, so from hiragana Insert goes to half-width kata
 across Right Ctrl.  
 It does not replace IBus or Mozc. It fills the gaps between IBus, Mozc, X11 and XFCE.
 
-## Parts
+### Parts
 
 | File                  | Purpose                                                         |
 | --------------------- | --------------------------------------------------------------- |
@@ -69,7 +71,7 @@ export GTK_IM_MODULE=ibus QT_IM_MODULE=ibus XMODIFIERS=@im=ibus
 export SDL_IM_MODULE=ibus CLUTTER_IM_MODULE=ibus
 ```
 
-## Keyboard mapping
+### Keyboard mapping
 
 ```text
 keycode 105 = Katakana          Right Ctrl -> XFCE grab -> kana-toggle
@@ -87,7 +89,7 @@ xmodmap ~/.Xmodmap && kana-switch norepeat
 re-applies `~/.Xmodmap` whenever it finds it dropped - a keyboard plugged in or woken from suspend re-asserts the XKB
 layout.
 
-## XFCE shortcuts
+### XFCE shortcuts
 
 Settings -> Keyboard -> Application Shortcuts:
 
@@ -98,13 +100,15 @@ Settings -> Keyboard -> Application Shortcuts:
 
 Apply `~/.Xmodmap` before recording them. `./install --shortcuts` writes both with `xfconf-query`.
 
-## Autostart
+### Autostart
 
 ```sh
 cp launchers/*.desktop ~/.config/autostart/
 ```
 
-## Testing
+## Usage
+
+### Testing
 
 ```text
 Right Ctrl -> hiragana <-> katakana
@@ -125,7 +129,7 @@ Menu       -> English <-> Japanese
 
 Every one is a single press. A press switches immediately; holding a key still switches exactly once.
 
-## Application support
+### Application support
 
 Every application reaches IBus by one of these routes. The carrier is injected with XTEST at the server level. It
 arrives as an ordinary key press whichever route the focused window uses.
@@ -150,7 +154,7 @@ arrives as an ordinary key press whichever route the focused window uses.
 [ ?  ]   2     1530  Xfce4-panel            GTK_IM_MODULE=ibus; no module loaded yet
 ```
 
-### Electron does not talk to IBus
+#### Electron does not talk to IBus
 
 With `GTK_IM_MODULE=ibus`, an Electron application **does** load
 `im-ibus.so`, **does** open an IBus input context, and **does** report focus and cursor position into it. It never
@@ -175,7 +179,7 @@ preedit.
 
 P.S Do not set `GTK_IM_MODULE=xim` globally to "fix" this as it downgrades every actual GTK3 program.
 
-### Steam's UI has no module to load
+#### Steam's UI has no module to load
 
 Electron loads `im-ibus.so` and ignores it; Steam's client UI never gets
 one. Since the sniper container became mandatory, `steamwebhelper` (CEF) runs inside pressure-vessel, and the GTK3 in
@@ -218,7 +222,7 @@ ime-launch --unwrap-desktop steam   # put it back
 Games launched from Steam inherit `GTK_IM_MODULE=xim` from the client. They reach IBus over
 XIM already, through SDL or Wine, and neither reads that variable.
 
-### Custom launcher parameters
+#### Custom launcher parameters
 
 | Parameter                           | Does                                                                   |
 | ----------------------------------- | ---------------------------------------------------------------------- |
@@ -231,7 +235,7 @@ XIM already, through SDL or Wine, and neither reads that variable.
 | `--dry-run`                         | with either wrap mode: list what would change, change nothing          |
 | `./install --wrappers`              | `--wrap-all` as an install step; `--all` includes it                   |
 
-### GTK4 hangs on one D-Bus name
+#### GTK4 hangs on one D-Bus name
 
 GTK4 input is decided entirely by whether `org.freedesktop.IBus` has an owner on the session bus.
 
@@ -243,7 +247,7 @@ if (!_daemon_is_running)
     return gtk_im_context_filter_keypress (ibusimcontext->slave, event);
 ```
 
-### flatpak
+#### flatpak
 
 A flatpak gets neither the session's IM environment nor a route to IBus. One global override covers every app:
 
@@ -264,14 +268,14 @@ flatpak override --user --env=GTK_IM_MODULE=xim <app>   # what it writes
 flatpak override --user --reset <app>                   # what undoes it
 ```
 
-### Fullscreen and games
+#### Fullscreen and games
 
 | Case                                      | Typing Japanese | Right Ctrl (XFCE global grab) |
 | ----------------------------------------- | --------------- | ----------------------------- |
 | fullscreen, no keyboard grab              | works           | fires                         |
 | fullscreen + exclusive seat keyboard grab | works           | fires                         |
 
-### The leftover candidate box
+#### The leftover candidate box
 
 When a conversion ends, `ibus-ui-gtk3` shrinks its candidate window to just the two page arrows and leaves it mapped,
 on screen, until the hide arrives up to a second and a half later. Measured transitions of that window while
@@ -293,7 +297,7 @@ IBUS_TIDY_SWEEP=2.0                  # safety sweep; IBUS_TIDY_POLL still read
 touch ~/.config/ibus-candidate-tidy.disabled   # turn it off
 ```
 
-## Commands
+### Commands
 
 ```sh
 ibus-mozc-init [--watch]          # run once / supervise the session
@@ -324,7 +328,7 @@ kana-switch --verbose toggle      # narrate one press
 mozc-keymap show|diff FILE|apply FILE [--restart]|reload
 ```
 
-## Files
+### Files
 
 ```text
 ~/.xprofile                              session IM environment (no daemon start)
@@ -339,7 +343,7 @@ $XDG_RUNTIME_DIR/mozc-kana-state[.lock|.follow.lock]
 ~/.config/mozc/config1.db.bak-*          mozc-keymap backups
 ```
 
-## Troubleshooting
+### Troubleshooting
 
 **Japanese does not work in one particular application**, and everything else is fine.
 
@@ -388,7 +392,7 @@ Empty candidate box, or one that keeps re-appearing. `pgrep -af 'ibus-candidate[
 real candidate list gets parked, that threshold is too high for your font size. Disable entirely with
 `touch ~/.config/ibus-candidate-tidy.disabled`.
 
-## Removing
+## Removal
 
 ```sh
 rm -f ~/.local/bin/{kana-switch,kana-toggle,kana-width,ibus-mozc-init,ibus-health,ibus-candidate-tidy,mozc-keymap,ime-launch,ime-probe}
