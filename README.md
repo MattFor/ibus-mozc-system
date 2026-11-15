@@ -1,4 +1,4 @@
-# ibus-mozc-system
+# IBus Mozc System
 
 [![CI](https://github.com/MattFor/ibus-mozc-system/actions/workflows/ci.yml/badge.svg)](https://github.com/MattFor/ibus-mozc-system/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattFor/ibus-mozc-system)](https://github.com/MattFor/ibus-mozc-system/releases/latest)
