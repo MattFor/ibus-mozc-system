@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.4] - 09:01 CET 16-11-2026
 
 ### Fixed
 
@@ -61,6 +61,7 @@
 
 Initial release.
 
+[1.2.4]: https://github.com/MattFor/ibus-mozc-system/releases/tag/v1.2.4
 [1.2.3]: https://github.com/MattFor/ibus-mozc-system/releases/tag/v1.2.3
 [1.2.2]: https://github.com/MattFor/ibus-mozc-system/releases/tag/v1.2.2
 [1.2.1]: https://github.com/MattFor/ibus-mozc-system/releases/tag/v1.2.1
