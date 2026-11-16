@@ -639,7 +639,10 @@ def main(argv):
 		i = argv.index("--window")
 		if i + 1 >= len(argv):
 			die("--window needs a window id")
-		wid = argv[i + 1]
+		try:
+			wid = str(int(argv[i + 1], 0))  # decimal, as xdotool reports the focus; xprop and wmctrl print hex
+		except ValueError:
+			die(f"--window needs a window id, not {argv[i + 1]!r}")
 
 	watch = "--watch" in argv
 	seconds = WATCH_SECONDS if watch else INJECT_SECONDS
