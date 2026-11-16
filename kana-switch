@@ -170,6 +170,50 @@ except OSError:
 	xtst = None
 
 
+class XDeviceInfo(ctypes.Structure):
+	_fields_ = [
+		("id", ctypes.c_ulong),
+		("type", ctypes.c_ulong),
+		("name", ctypes.c_char_p),
+		("num_classes", ctypes.c_int),
+		("use", ctypes.c_int),
+		("inputclassinfo", ctypes.c_void_p),
+	]
+
+
+class XDeviceState(ctypes.Structure):
+	_fields_ = [("device_id", ctypes.c_ulong), ("num_classes", ctypes.c_int), ("data", ctypes.c_void_p)]
+
+
+class XKeyState(ctypes.Structure):
+	_fields_ = [
+		("class_", ctypes.c_ubyte),
+		("length", ctypes.c_ubyte),
+		("num_keys", ctypes.c_short),
+		("keys", ctypes.c_ubyte * 32),
+	]
+
+
+IS_X_EXTENSION_KEYBOARD, KEY_CLASS = 3, 0
+
+try:
+	xi = ctypes.CDLL("libXi.so.6")
+	xi.XListInputDevices.restype = ctypes.POINTER(XDeviceInfo)
+	xi.XListInputDevices.argtypes = [Display, ctypes.POINTER(ctypes.c_int)]
+	xi.XFreeDeviceList.restype, xi.XFreeDeviceList.argtypes = None, [ctypes.POINTER(XDeviceInfo)]
+	xi.XOpenDevice.restype, xi.XOpenDevice.argtypes = ctypes.c_void_p, [Display, ctypes.c_ulong]
+	xi.XCloseDevice.restype, xi.XCloseDevice.argtypes = ctypes.c_int, [Display, ctypes.c_void_p]
+	xi.XQueryDeviceState.restype = ctypes.POINTER(XDeviceState)
+	xi.XQueryDeviceState.argtypes = [Display, ctypes.c_void_p]
+	xi.XFreeDeviceState.restype, xi.XFreeDeviceState.argtypes = None, [ctypes.POINTER(XDeviceState)]
+except OSError:
+	xi = None
+
+ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, Display, ctypes.c_void_p)
+x11.XSetErrorHandler.restype, x11.XSetErrorHandler.argtypes = ctypes.c_void_p, [ERROR_HANDLER]
+_ignore_errors = ERROR_HANDLER(lambda _dpy, _event: 0)
+
+
 def open_display(required=True):
 	dpy = x11.XOpenDisplay(None)
 	if not dpy and required:
@@ -274,6 +318,76 @@ def fake_key(dpy, keycode, press):
 	return True
 
 
+def open_keyboards(dpy):
+	"""XInput handles for the real keyboards: every slave keyboard but the XTEST ones."""
+	if xi is None:
+		return []
+
+	# A keyboard unplugged meanwhile must not end this process with a modifier pressed.
+	x11.XSetErrorHandler(_ignore_errors)
+	count = ctypes.c_int()
+	devices = xi.XListInputDevices(dpy, ctypes.byref(count))
+	if not devices:
+		return []
+
+	ids = [
+		devices[i].id
+		for i in range(count.value)
+		if devices[i].use == IS_X_EXTENSION_KEYBOARD and not (devices[i].name or b"").endswith(b"XTEST keyboard")
+	]
+	xi.XFreeDeviceList(devices)
+
+	return [handle for handle in (xi.XOpenDevice(dpy, i) for i in ids) if handle]
+
+
+def physically_held(dpy, keyboards):
+	"""Keycodes down on the real keyboards themselves, not on the core keyboard that merges them with XTEST."""
+	held = set()
+	if xi is None:
+		return held
+
+	for handle in keyboards:
+		state = xi.XQueryDeviceState(dpy, handle)
+		if not state:
+			continue
+
+		addr = state.contents.data
+		for _ in range(state.contents.num_classes):
+			cls = ctypes.cast(addr, ctypes.POINTER(XKeyState)).contents
+			if cls.class_ == KEY_CLASS:
+				held |= {kc for kc in range(256) if cls.keys[kc >> 3] >> (kc & 7) & 1}
+			addr += cls.length
+		xi.XFreeDeviceState(state)
+
+	return held
+
+
+def restore_held(dpy, cleared):
+	"""Press the cleared modifiers the user still holds again, each only until its real key comes up."""
+	if not cleared or xi is None or not have_xtest(dpy):
+		return
+
+	# The core keyboard keeps one state for all devices: a press left on XTEST outlives the real
+	# release, or sticks for good if that release came first, so follow each real keyboard instead.
+	keyboards = open_keyboards(dpy)
+	try:
+		pressed = set(cleared) & physically_held(dpy, keyboards)
+		for kc in pressed:
+			fake_key(dpy, kc, True)
+
+		deadline = time.monotonic() + HOLD_MS / 1000.0
+		while pressed:
+			x11.XSync(dpy, False)
+			time.sleep(0.01)
+			up = pressed if time.monotonic() >= deadline else pressed - physically_held(dpy, keyboards)
+			for kc in up:
+				fake_key(dpy, kc, False)
+			pressed -= up
+	finally:
+		for handle in keyboards:
+			xi.XCloseDevice(dpy, handle)
+
+
 def wait_for_release(dpy, triggers):
 	"""When the shortcut key came up, or when we stopped waiting for it."""
 	start = time.monotonic()
@@ -357,9 +471,7 @@ def send_keysym(dpy, name, table, per_code, trigger_kcs, stuck_mods):
 			except (OSError, subprocess.SubprocessError) as e:
 				log(f"xdotool fallback failed: {e}")
 
-		for kc in to_clear:
-			fake_key(dpy, kc, True)
-
+		restore_held(dpy, to_clear)
 		x11.XSync(dpy, False)
 	finally:
 		# A borrowed keycode left in place would type the carrier for the rest of the session.

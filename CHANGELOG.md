@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `kana-switch` no longer leaves a modifier stuck down when it falls back to injecting keys. It
+  pressed the modifiers it had cleared again on the XTEST keyboard, so a modifier let go meanwhile
+  stayed down for good; it now follows each real keyboard's own key state, presses again only what
+  is still held, and lets go of each one as soon as its real key comes up.
+
 ## [1.2.3] - 08:01 CET 16-11-2026
 
 ### Fixed
